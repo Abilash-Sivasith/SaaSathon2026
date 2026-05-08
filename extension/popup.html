@@ -26,6 +26,18 @@
       #start:disabled { background: #444; color: #888; cursor: default; }
       #stop  { background: #c62828; color: #fff; }
       #stop:disabled  { background: #444; color: #888; cursor: default; }
+      #popout {
+        width: 100%;
+        padding: 7px;
+        border: 1px solid #3a3a3a;
+        border-radius: 4px;
+        margin-bottom: 8px;
+        background: #222;
+        color: #ddd;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      #popout:disabled { color: #777; cursor: default; }
 
       #preview-wrap {
         position: relative;
@@ -117,6 +129,7 @@
       <button id="start">&#9654; Start</button>
       <button id="stop" disabled>&#9632; Stop</button>
     </div>
+    <button id="popout">Open Detached Window</button>
 
     <div id="log"></div>
 

@@ -1,11 +1,15 @@
 const startBtn  = document.getElementById('start');
 const stopBtn   = document.getElementById('stop');
+const popoutBtn = document.getElementById('popout');
 const logEl     = document.getElementById('log');
 const preview   = document.getElementById('screen-preview');
 const placeholder = document.getElementById('preview-placeholder');
 const barTab    = document.getElementById('bar-tab');
 const barMic    = document.getElementById('bar-mic');
 const barSys    = document.getElementById('bar-sys');
+const urlParams = new URLSearchParams(window.location.search);
+const isDetachedWindow = urlParams.get('mode') === 'window';
+const sourceTabId = Number(urlParams.get('sourceTabId'));
 
 let screenStream  = null; // getDisplayMedia (video + optional system audio)
 let tabStream     = null; // chrome.tabCapture  (tab audio)
@@ -68,6 +72,13 @@ function normalizeCaptureError(err, step) {
     if (name === 'PermissionDeniedError' || name === 'NotAllowedError') {
       return 'Tab audio capture was denied. Keep the target tab active and try Start again.';
     }
+    if (message.includes('Extension has not been invoked for the current page')) {
+      return [
+        'Tab audio capture is not authorized for the selected tab.',
+        'Open this extension from the tab you want to capture, then click "Open Detached Window" again.',
+        'Chrome internal pages (chrome://, Web Store, Extensions) cannot be captured.',
+      ].join(' ');
+    }
   }
 
   if (step === 'screen') {
@@ -90,6 +101,49 @@ async function getMicPermissionState() {
   } catch {
     return 'unknown';
   }
+}
+
+function getTabStreamByCapture() {
+  return new Promise((res, rej) =>
+    chrome.tabCapture.capture({ audio: true, video: false }, (s) =>
+      chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res(s)
+    )
+  );
+}
+
+function getTabMediaStreamId(targetTabId) {
+  return new Promise((res, rej) =>
+    chrome.tabCapture.getMediaStreamId({ targetTabId }, (streamId) =>
+      chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res(streamId)
+    )
+  );
+}
+
+async function getTabStreamById(targetTabId) {
+  const streamId = await getTabMediaStreamId(targetTabId);
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      mandatory: {
+        chromeMediaSource: 'tab',
+        chromeMediaSourceId: streamId,
+      },
+    },
+    video: false,
+  });
+}
+
+async function captureTabAudioStream() {
+  // In normal popup mode, activeTab context allows direct tabCapture.capture.
+  if (!isDetachedWindow) {
+    return getTabStreamByCapture();
+  }
+
+  // In detached window mode, bind to the originating tab via stream id.
+  if (Number.isInteger(sourceTabId) && sourceTabId > 0) {
+    return getTabStreamById(sourceTabId);
+  }
+
+  return getTabStreamByCapture();
 }
 
 function cleanupPartialCapture() {
@@ -213,11 +267,7 @@ async function startCapture() {
     // 1. Tab audio first — must happen before getDisplayMedia claims the tab
     currentStep = 'tab_audio';
     log('Requesting tab audio…', 'log-audio');
-    tabStream = await new Promise((res, rej) =>
-      chrome.tabCapture.capture({ audio: true, video: false }, (s) =>
-        chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res(s)
-      )
-    );
+    tabStream = await captureTabAudioStream();
     emitEvent('capture_start', { source: 'tab_audio' });
 
     // 2. Microphone
@@ -307,5 +357,30 @@ function stopCapture() {
   log('Capture stopped.', 'log-audio');
 }
 
+function openDetachedWindow() {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const activeId = tabs?.[0]?.id;
+    const query = Number.isInteger(activeId) && activeId > 0
+      ? `?mode=window&sourceTabId=${activeId}`
+      : '?mode=window';
+    chrome.windows.create(
+      {
+        url: chrome.runtime.getURL(`popup.html${query}`),
+        type: 'popup',
+        width: 380,
+        height: 720,
+        focused: true,
+      },
+      () => window.close()
+    );
+  });
+}
+
+if (isDetachedWindow && popoutBtn) {
+  popoutBtn.textContent = 'Detached Window Open';
+  popoutBtn.disabled = true;
+}
+
 startBtn.addEventListener('click', startCapture);
 stopBtn.addEventListener('click', stopCapture);
+popoutBtn?.addEventListener('click', openDetachedWindow);

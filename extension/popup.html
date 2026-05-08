@@ -38,6 +38,17 @@
         font-size: 12px;
       }
       #popout:disabled { color: #777; cursor: default; }
+      #overlay-toggle {
+        width: 100%;
+        padding: 7px;
+        border: 1px solid #3a3a3a;
+        border-radius: 4px;
+        margin-bottom: 8px;
+        background: #2b2b2b;
+        color: #ddd;
+        cursor: pointer;
+        font-size: 12px;
+      }
 
       #preview-wrap {
         position: relative;
@@ -169,6 +180,7 @@
       <button id="start">&#9654; Start</button>
       <button id="stop" disabled>&#9632; Stop</button>
     </div>
+    <button id="overlay-toggle">Show Transparent Overlay (POC)</button>
     <button id="popout">Open Detached Window</button>
 
     <div id="log"></div>

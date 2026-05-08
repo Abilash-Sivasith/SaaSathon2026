@@ -1,6 +1,7 @@
 const startBtn  = document.getElementById('start');
 const stopBtn   = document.getElementById('stop');
 const popoutBtn = document.getElementById('popout');
+const overlayToggleBtn = document.getElementById('overlay-toggle');
 const logEl     = document.getElementById('log');
 const preview   = document.getElementById('screen-preview');
 const placeholder = document.getElementById('preview-placeholder');
@@ -283,6 +284,25 @@ function attachRecorder(stream, label) {
   recorders.push({ label, rec, stopped });
 }
 
+function finalizeRecordings() {
+  // Placeholder for future recording UI; keep stop flow safe for now.
+  Object.values(chunkStore).forEach((chunks) => {
+    if (Array.isArray(chunks)) {
+      chunks.length = 0;
+    }
+  });
+  chunkStore = {};
+
+  objectUrls.forEach((url) => {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      // no-op
+    }
+  });
+  objectUrls = [];
+}
+
 // ── Start / Stop ──────────────────────────────────────────────────────────────
 
 async function startCapture() {
@@ -382,38 +402,43 @@ async function startCapture() {
 }
 
 async function stopCapture() {
-  const activeRecorders = [...recorders];
-  activeRecorders.forEach(({ rec }) => rec.state !== 'inactive' && rec.stop());
-  await Promise.allSettled(activeRecorders.map(({ stopped }) => stopped));
-  recorders = [];
+  try {
+    const activeRecorders = [...recorders];
+    activeRecorders.forEach(({ rec }) => rec.state !== 'inactive' && rec.stop());
+    await Promise.allSettled(activeRecorders.map(({ stopped }) => stopped));
+    recorders = [];
 
-  finalizeRecordings();
-
-  if (audioCtx) { audioCtx.close(); audioCtx = null; }
-  if (tabMonitorNodes) {
-    try {
-      tabMonitorNodes.src.disconnect();
-      tabMonitorNodes.gain.disconnect();
-    } catch {
-      // no-op
+    finalizeRecordings();
+  } catch (err) {
+    console.error(err);
+    log(`Stop encountered an issue: ${err?.message || err}`, 'log-error');
+  } finally {
+    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    if (tabMonitorNodes) {
+      try {
+        tabMonitorNodes.src.disconnect();
+        tabMonitorNodes.gain.disconnect();
+      } catch {
+        // no-op
+      }
+      tabMonitorNodes = null;
     }
-    tabMonitorNodes = null;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
+
+    [screenStream, tabStream, micStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
+    screenStream = tabStream = micStream = null;
+    packetSeq = 0;
+
+    preview.srcObject = null;
+    placeholder.style.display = '';
+    barTab.style.width = barMic.style.width = barSys.style.width = '0%';
+
+    startBtn.disabled = false;
+    stopBtn.disabled  = true;
+    emitEvent('capture_stop', {});
+    log('Capture stopped.', 'log-audio');
   }
-  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-  if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
-
-  [screenStream, tabStream, micStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
-  screenStream = tabStream = micStream = null;
-  packetSeq = 0;
-
-  preview.srcObject = null;
-  placeholder.style.display = '';
-  barTab.style.width = barMic.style.width = barSys.style.width = '0%';
-
-  startBtn.disabled = false;
-  stopBtn.disabled  = true;
-  emitEvent('capture_stop', {});
-  log('Capture stopped.', 'log-audio');
 }
 
 function openDetachedWindow() {
@@ -435,6 +460,153 @@ function openDetachedWindow() {
   });
 }
 
+function toggleOverlay() {
+  const withTargetTab = (activeTab) => {
+    const tabId = activeTab?.id;
+    if (!Number.isInteger(tabId)) {
+      log('No active tab found for overlay preview.', 'log-error');
+      return;
+    }
+    const tabUrl = activeTab?.url || '';
+    if (
+      tabUrl.startsWith('chrome://') ||
+      tabUrl.startsWith('chrome-extension://') ||
+      tabUrl.startsWith('edge://') ||
+      tabUrl.startsWith('about:')
+    ) {
+      log(
+        'Overlay cannot be injected on browser internal pages. Open a normal website (for example https://example.com) and try again.',
+        'log-error'
+      );
+      return;
+    }
+
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        func: (overlayTextLeft, overlayTextRight) => {
+          const OVERLAY_ID = 'obli-overlay-poc';
+          const existing = document.getElementById(OVERLAY_ID);
+          if (existing) {
+            existing.remove();
+            return { state: 'removed' };
+          }
+
+          const overlay = document.createElement('div');
+          overlay.id = OVERLAY_ID;
+          Object.assign(overlay.style, {
+            position: 'fixed',
+            inset: '0',
+            zIndex: '2147483647',
+            display: 'grid',
+            gridTemplateColumns: '20vw 1fr 20vw',
+            pointerEvents: 'none',
+          });
+
+          const leftPanel = document.createElement('div');
+          Object.assign(leftPanel.style, {
+            height: '100%',
+            background: 'rgba(0, 0, 0, 0.3)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          });
+
+          const centerPanel = document.createElement('div');
+          Object.assign(centerPanel.style, {
+            height: '100%',
+            background: 'transparent',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          });
+
+          const rightPanel = document.createElement('div');
+          Object.assign(rightPanel.style, {
+            height: '100%',
+            background: 'rgba(0, 0, 0, 0.3)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          });
+
+          const textBaseStyle = {
+            padding: '16px 24px',
+            borderRadius: '12px',
+            background: 'rgba(0, 0, 0, 0.35)',
+            color: '#ffffff',
+            fontSize: '24px',
+            fontFamily: 'Arial, sans-serif',
+            fontWeight: '700',
+            letterSpacing: '0.02em',
+            textAlign: 'center',
+            boxShadow: '0 6px 24px rgba(0, 0, 0, 0.35)',
+          };
+
+          const leftTextBox = document.createElement('div');
+          leftTextBox.textContent = overlayTextLeft;
+          Object.assign(leftTextBox.style, textBaseStyle);
+
+          const rightTextBox = document.createElement('div');
+          rightTextBox.textContent = overlayTextRight;
+          Object.assign(rightTextBox.style, textBaseStyle);
+
+          leftPanel.appendChild(leftTextBox);
+          rightPanel.appendChild(rightTextBox);
+          overlay.appendChild(leftPanel);
+          overlay.appendChild(centerPanel);
+          overlay.appendChild(rightPanel);
+          document.body.appendChild(overlay);
+          return { state: 'added' };
+        },
+        args: ['Add some text here', 'Add some text here'],
+      },
+      (results) => {
+        if (chrome.runtime.lastError) {
+          const msg = chrome.runtime.lastError.message || 'Unknown script injection error.';
+          if (tabUrl.startsWith('file://')) {
+            log(
+              `Overlay inject failed: ${msg} Enable "Allow access to file URLs" in chrome://extensions for this extension, or test on a regular website.`,
+              'log-error'
+            );
+            return;
+          }
+          log(
+            `Overlay inject failed: ${msg} Try a regular website (https://...) instead of a restricted page.`,
+            'log-error'
+          );
+          return;
+        }
+        const state = results?.[0]?.result?.state;
+        if (state === 'added') {
+          log('Transparent overlay preview shown on active tab.', 'log-screen');
+        } else if (state === 'removed') {
+          log('Transparent overlay preview removed.', 'log-screen');
+        }
+      }
+    );
+  };
+
+  // In detached mode, target the original tab that launched this window.
+  if (isDetachedWindow && Number.isInteger(sourceTabId) && sourceTabId > 0) {
+    chrome.tabs.get(sourceTabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        log(
+          'Could not find the original source tab. Re-open detached window from the tab you want to preview.',
+          'log-error'
+        );
+        return;
+      }
+      withTargetTab(tab);
+    });
+    return;
+  }
+
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    withTargetTab(tabs?.[0]);
+  });
+}
+
 if (isDetachedWindow && popoutBtn) {
   popoutBtn.textContent = 'Detached Window Open';
   popoutBtn.disabled = true;
@@ -443,3 +615,4 @@ if (isDetachedWindow && popoutBtn) {
 startBtn.addEventListener('click', startCapture);
 stopBtn.addEventListener('click', stopCapture);
 popoutBtn?.addEventListener('click', openDetachedWindow);
+overlayToggleBtn?.addEventListener('click', toggleOverlay);

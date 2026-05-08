@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Screen & Audio Logger",
+  "version": "0.2.0",
+  "description": "Capture screen, tab audio, and microphone in real time. Logs data locally; ready for backend integration.",
+  "permissions": [
+    "tabCapture",
+    "activeTab",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Screen & Audio Logger"
+  }
+}

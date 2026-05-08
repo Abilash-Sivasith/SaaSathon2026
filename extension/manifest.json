@@ -5,6 +5,8 @@
   "description": "Capture screen, tab audio, and microphone in real time. Logs data locally; ready for backend integration.",
   "permissions": [
     "tabCapture",
+    "audioCapture",
+    "downloads",
     "activeTab",
     "scripting",
     "offscreen"

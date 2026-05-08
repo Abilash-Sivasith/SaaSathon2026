@@ -1,13 +1,15 @@
 const startBtn  = document.getElementById('start');
 const stopBtn   = document.getElementById('stop');
+const popoutBtn = document.getElementById('popout');
 const logEl     = document.getElementById('log');
 const preview   = document.getElementById('screen-preview');
 const placeholder = document.getElementById('preview-placeholder');
 const barTab    = document.getElementById('bar-tab');
 const barMic    = document.getElementById('bar-mic');
 const barSys    = document.getElementById('bar-sys');
-const recordingsEl = document.getElementById('recordings');
-const recordingsEmptyEl = document.getElementById('recordings-empty');
+const urlParams = new URLSearchParams(window.location.search);
+const isDetachedWindow = urlParams.get('mode') === 'window';
+const sourceTabId = Number(urlParams.get('sourceTabId'));
 
 let screenStream  = null; // getDisplayMedia (video + optional system audio)
 let tabStream     = null; // chrome.tabCapture  (tab audio)
@@ -17,11 +19,14 @@ let audioCtx      = null;
 let rafId         = null;
 let frameInterval = null;
 let recorders     = [];   // one MediaRecorder per stream
+let packetSeq     = 0;    // monotonic packet id for media chunks
+
 let eventSeq      = 0;
 let lastLevelLogTs = 0;
 let chunkStore     = {};
 let objectUrls     = [];
 let tabMonitorNodes = null;
+
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -56,118 +61,129 @@ function emitEvent(type, payload) {
   return event;
 }
 
-async function blobPrefixB64(blob, bytes = 120) {
-  const slice = blob.slice(0, bytes);
-  const buf = await slice.arrayBuffer();
-  const arr = new Uint8Array(buf);
-  let bin = '';
-  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
-  return btoa(bin);
-}
+function normalizeCaptureError(err, step) {
+  const name = err?.name || '';
+  const message = String(err?.message || err || '');
+  const msgLower = message.toLowerCase();
 
-function formatBytes(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-function resetSessionBuffers() {
-  chunkStore = {
-    tab: { chunks: [], mimeType: '' },
-    mic: { chunks: [], mimeType: '' },
-    system_audio: { chunks: [], mimeType: '' },
-  };
-}
-
-function clearObjectUrls() {
-  objectUrls.forEach((u) => URL.revokeObjectURL(u));
-  objectUrls = [];
-}
-
-function clearRecordingsUI() {
-  recordingsEl.querySelectorAll('.rec-card').forEach((n) => n.remove());
-  recordingsEmptyEl.style.display = '';
-}
-
-function saveBlobLocally(blobUrl, fileName) {
-  if (chrome.downloads && chrome.downloads.download) {
-    chrome.downloads.download({
-      url: blobUrl,
-      filename: fileName,
-      saveAs: true,
-    }, () => {
-      if (chrome.runtime.lastError) {
-        log(`Save failed: ${chrome.runtime.lastError.message}`, 'log-error');
-      } else {
-        log(`Saved: ${fileName}`, 'log-audio');
-      }
-    });
-    return;
+  if (step === 'microphone') {
+    if (name === 'NotAllowedError' && msgLower.includes('dismissed')) {
+      return [
+        'Microphone permission was dismissed.',
+        'Please click Start again and allow mic access in the prompt.',
+        'If no prompt appears, reset mic permission for this extension in Chrome site settings, then retry.',
+      ].join(' ');
+    }
+    if (name === 'NotAllowedError') {
+      return [
+        'Microphone permission was denied.',
+        'Allow microphone for Chrome and this extension, then retry.',
+      ].join(' ');
+    }
+    if (name === 'NotFoundError') {
+      return 'No microphone was found. Connect/select an input device and retry.';
+    }
+    if (name === 'NotReadableError') {
+      return 'Microphone is busy or unavailable. Close apps using it (Zoom/Meet) and retry.';
+    }
   }
 
-  const a = document.createElement('a');
-  a.href = blobUrl;
-  a.download = fileName;
-  a.click();
+  if (step === 'tab_audio') {
+    if (name === 'PermissionDeniedError' || name === 'NotAllowedError') {
+      return 'Tab audio capture was denied. Keep the target tab active and try Start again.';
+    }
+    if (message.includes('Extension has not been invoked for the current page')) {
+      return [
+        'Tab audio capture is not authorized for the selected tab.',
+        'Open this extension from the tab you want to capture, then click "Open Detached Window" again.',
+        'Chrome internal pages (chrome://, Web Store, Extensions) cannot be captured.',
+      ].join(' ');
+    }
+  }
+
+  if (step === 'screen') {
+    if (name === 'NotAllowedError') {
+      return 'Screen capture was denied or dismissed. Re-run Start and approve screen sharing.';
+    }
+    if (name === 'NotReadableError') {
+      return 'Screen capture source became unavailable. Re-select the source and retry.';
+    }
+  }
+
+  return `Unexpected ${step} error (${name || 'unknown'}): ${message}`;
 }
 
-function renderRecordingCard(label, blob, mimeType) {
-  recordingsEmptyEl.style.display = 'none';
-
-  const blobUrl = URL.createObjectURL(blob);
-  objectUrls.push(blobUrl);
-
-  const card = document.createElement('div');
-  card.className = 'rec-card';
-
-  const head = document.createElement('div');
-  head.className = 'rec-head';
-
-  const source = document.createElement('span');
-  source.textContent = `Source: ${label}`;
-
-  const actions = document.createElement('div');
-  actions.className = 'rec-actions';
-  const saveBtn = document.createElement('button');
-  saveBtn.className = 'rec-btn';
-  saveBtn.textContent = 'Save';
-  const fileName = `obli-${label}-${new Date().toISOString().replace(/[:.]/g, '-')}.webm`;
-  saveBtn.addEventListener('click', () => saveBlobLocally(blobUrl, fileName));
-  actions.appendChild(saveBtn);
-
-  head.appendChild(source);
-  head.appendChild(actions);
-
-  const audio = document.createElement('audio');
-  audio.controls = true;
-  audio.src = blobUrl;
-  audio.style.width = '100%';
-
-  const meta = document.createElement('div');
-  meta.className = 'rec-meta';
-  meta.textContent = `${mimeType || 'audio/webm'} • ${formatBytes(blob.size)}`;
-
-  card.appendChild(head);
-  card.appendChild(audio);
-  card.appendChild(meta);
-  recordingsEl.prepend(card);
-
-  emitEvent('recording_ready', {
-    label,
-    size: blob.size,
-    mimeType: mimeType || blob.type || 'audio/webm',
-    fileName,
-  });
-  log(`Recording ready [${label}] ${formatBytes(blob.size)}`, 'log-audio');
+async function getMicPermissionState() {
+  if (!navigator.permissions?.query) return 'unknown';
+  try {
+    const status = await navigator.permissions.query({ name: 'microphone' });
+    return status.state; // 'granted' | 'denied' | 'prompt'
+  } catch {
+    return 'unknown';
+  }
 }
 
-function finalizeRecordings() {
-  ['tab', 'mic', 'system_audio'].forEach((label) => {
-    const item = chunkStore[label];
-    if (!item || item.chunks.length === 0) return;
-    const blob = new Blob(item.chunks, { type: item.mimeType || 'audio/webm' });
-    renderRecordingCard(label, blob, item.mimeType);
+function getTabStreamByCapture() {
+  return new Promise((res, rej) =>
+    chrome.tabCapture.capture({ audio: true, video: false }, (s) =>
+      chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res(s)
+    )
+  );
+}
+
+function getTabMediaStreamId(targetTabId) {
+  return new Promise((res, rej) =>
+    chrome.tabCapture.getMediaStreamId({ targetTabId }, (streamId) =>
+      chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res(streamId)
+    )
+  );
+}
+
+async function getTabStreamById(targetTabId) {
+  const streamId = await getTabMediaStreamId(targetTabId);
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      mandatory: {
+        chromeMediaSource: 'tab',
+        chromeMediaSourceId: streamId,
+      },
+    },
+    video: false,
   });
+}
+
+async function captureTabAudioStream() {
+  // In normal popup mode, activeTab context allows direct tabCapture.capture.
+  if (!isDetachedWindow) {
+    return getTabStreamByCapture();
+  }
+
+  // In detached window mode, bind to the originating tab via stream id.
+  if (Number.isInteger(sourceTabId) && sourceTabId > 0) {
+    return getTabStreamById(sourceTabId);
+  }
+
+  return getTabStreamByCapture();
+}
+
+function cleanupPartialCapture() {
+  recorders.forEach(r => r.state !== 'inactive' && r.stop());
+  recorders = [];
+
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
+
+  [screenStream, tabStream, micStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
+  screenStream = tabStream = micStream = null;
+  packetSeq = 0;
+
+  preview.srcObject = null;
+  placeholder.style.display = '';
+  barTab.style.width = barMic.style.width = barSys.style.width = '0%';
+
+  startBtn.disabled = false;
+  stopBtn.disabled  = true;
 }
 
 // ── Audio metering ────────────────────────────────────────────────────────────
@@ -244,23 +260,23 @@ function attachRecorder(stream, label) {
 
   rec.ondataavailable = async (ev) => {
     if (!ev.data || ev.data.size === 0) return;
-    const b64prefix = await blobPrefixB64(ev.data, 120);
 
-    if (!chunkStore[label]) {
-      chunkStore[label] = { chunks: [], mimeType: rec.mimeType || ev.data.type || 'audio/webm' };
-    }
-    if (!chunkStore[label].mimeType) {
-      chunkStore[label].mimeType = rec.mimeType || ev.data.type || 'audio/webm';
-    }
-    chunkStore[label].chunks.push(ev.data);
-
-    emitEvent('media_chunk', {
+    packetSeq += 1;
+    const payload = {
+      packetId: packetSeq,
       label,
       size: ev.data.size,
-      mimeType: rec.mimeType,
-      b64prefix,
-    });
-    log(`Chunk [${label}] ${ev.data.size} bytes, b64prefix=${b64prefix.slice(0, 20)}...`, 'log-audio');
+      mimeType: rec.mimeType || ev.data.type || 'unknown',
+      dataType: Object.prototype.toString.call(ev.data), // typically "[object Blob]"
+      constructorName: ev.data.constructor?.name || 'unknown',
+      isBlob: ev.data instanceof Blob,
+    };
+    emitEvent('media_chunk', payload);
+    log(
+      `Packet #${payload.packetId} [${label}] ${payload.size} bytes ` +
+      `mime=${payload.mimeType} data=${payload.constructorName}`,
+      'log-audio'
+    );
   };
   rec.onstop = () => resolveStopped();
   rec.start(1000);
@@ -270,28 +286,35 @@ function attachRecorder(stream, label) {
 // ── Start / Stop ──────────────────────────────────────────────────────────────
 
 async function startCapture() {
-  let stage = 'initialization';
+  let currentStep = 'initialization';
   try {
-    clearObjectUrls();
-    clearRecordingsUI();
-    resetSessionBuffers();
+    const micPermissionState = await getMicPermissionState();
+    if (micPermissionState === 'denied') {
+      log(
+        'Microphone is currently blocked for this extension (no prompt will appear). ' +
+        'Open Chrome site settings for this extension and allow Microphone, then retry.',
+        'log-error'
+      );
+      return;
+    }
+    if (micPermissionState === 'prompt') {
+      log('Chrome should show a microphone permission prompt next.', 'log-audio');
+    }
 
-    // 1. Tab audio via chrome.tabCapture
-    stage = 'tab audio permission';
+    // 1. Tab audio first — must happen before getDisplayMedia claims the tab
+    currentStep = 'tab_audio';
     log('Requesting tab audio…', 'log-audio');
-    tabStream = await new Promise((res, rej) =>
-      chrome.tabCapture.capture({ audio: true, video: false }, (s) =>
-        chrome.runtime.lastError
-          ? rej(new Error(chrome.runtime.lastError.message))
-          : s
-            ? res(s)
-            : rej(new Error('Tab audio capture returned no stream.'))
-      )
-    );
+    tabStream = await captureTabAudioStream();
     emitEvent('capture_start', { source: 'tab_audio' });
 
-    // 2. Screen (video + system audio if the OS/browser allows it)
-    stage = 'screen permission';
+    // 2. Microphone
+    currentStep = 'microphone';
+    log('Requesting microphone…', 'log-audio');
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    emitEvent('capture_start', { source: 'microphone' });
+
+    // 3. Screen (video + system audio if the OS/browser allows it)
+    currentStep = 'screen';
     log('Requesting screen capture…', 'log-screen');
     screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: { cursor: 'always', frameRate: { ideal: 30 } },
@@ -306,37 +329,6 @@ async function startCapture() {
     log(`Screen: ${settings.width}x${settings.height} @ ${settings.frameRate}fps`, 'log-screen');
     emitEvent('capture_start', { source: 'screen', ...settings });
 
-    // 3. Microphone (optional)
-    stage = 'microphone permission';
-    log('Requesting microphone…', 'log-audio');
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
-
-      if (!micStream.getAudioTracks().length) {
-        throw new Error('No microphone track was returned by the browser.');
-      }
-      emitEvent('capture_start', { source: 'microphone' });
-    } catch (micErr) {
-      // Some devices reject strict constraints; retry with plain audio.
-      try {
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        emitEvent('capture_start', { source: 'microphone', fallback: true });
-        log('Microphone fallback capture enabled.', 'log-audio');
-      } catch {
-        micStream = null;
-        log(
-          `Microphone unavailable: ${micErr.message || micErr}. Continuing with tab/screen only.`,
-          'log-error'
-        );
-      }
-    }
 
     // Audio metering
     audioCtx = new AudioContext();
@@ -384,14 +376,8 @@ async function startCapture() {
     log('All sources active.', 'log-audio');
   } catch (err) {
     console.error(err);
-    log(`Error during ${stage}: ${err.message || err}`, 'log-error');
-
-    [screenStream, tabStream, micStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
-    screenStream = tabStream = micStream = null;
-    preview.srcObject = null;
-    placeholder.style.display = '';
-    startBtn.disabled = false;
-    stopBtn.disabled  = true;
+    cleanupPartialCapture();
+    log('Error: ' + normalizeCaptureError(err, currentStep), 'log-error');
   }
 }
 
@@ -418,6 +404,7 @@ async function stopCapture() {
 
   [screenStream, tabStream, micStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
   screenStream = tabStream = micStream = null;
+  packetSeq = 0;
 
   preview.srcObject = null;
   placeholder.style.display = '';
@@ -429,9 +416,30 @@ async function stopCapture() {
   log('Capture stopped.', 'log-audio');
 }
 
-  startBtn.addEventListener('click', () => {
-    startCapture();
+function openDetachedWindow() {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const activeId = tabs?.[0]?.id;
+    const query = Number.isInteger(activeId) && activeId > 0
+      ? `?mode=window&sourceTabId=${activeId}`
+      : '?mode=window';
+    chrome.windows.create(
+      {
+        url: chrome.runtime.getURL(`popup.html${query}`),
+        type: 'popup',
+        width: 380,
+        height: 720,
+        focused: true,
+      },
+      () => window.close()
+    );
   });
-  stopBtn.addEventListener('click', () => {
-    stopCapture();
-  });
+}
+
+if (isDetachedWindow && popoutBtn) {
+  popoutBtn.textContent = 'Detached Window Open';
+  popoutBtn.disabled = true;
+}
+
+startBtn.addEventListener('click', startCapture);
+stopBtn.addEventListener('click', stopCapture);
+popoutBtn?.addEventListener('click', openDetachedWindow);

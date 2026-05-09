@@ -32,11 +32,13 @@ let lastLevelLogTs = 0;
 let chunkStore     = {};
 let objectUrls     = [];
 let tabMonitorNodes = null;
+let captureStartInFlight = false;
 
 const transcribeQueues = {};
 const transcribeInFlight = {};
 const transcribeSeq = {};
 const transcribeBuffers = {};
+/** label -> timeout id (fixed-interval flush fallback, no silence wait) */
 const transcribeTimers = {};
 const lastRmsByLabel = { tab: 0, mic: 0, system_audio: 0 };
 let transcribeConfig = {
@@ -45,11 +47,14 @@ let transcribeConfig = {
   enabled: true,
 };
 
-// WebM chunks must exceed the server's minimum wav conversion size; WAV (mic PCM) ignores that limit.
-const TRANSCRIBE_MIN_BYTES = 44000;
-const TRANSCRIBE_MAX_INTERVAL_MS = 3200;
+// WebM must exceed server's minimum WAV convert size (~32KB). Larger thresholds → fewer, bigger transcript chunks (no silence/pause detection).
+const TRANSCRIBE_MIN_BYTES = 78000;
+// If we never reach MIN_BYTES (quiet tab), flush whatever we have after this wait.
+const TRANSCRIBE_MAX_INTERVAL_MS = 5000;
+// Mic PCM → WAV periodic flush (~4.5s of audio typical at 48k buffer growth).
+const TRANSCRIBE_PCM_INTERVAL_MS = 4500;
+
 const TRANSCRIBE_MIN_RMS = 0.002;
-const TRANSCRIBE_PCM_INTERVAL_MS = 2800;
 let micTranscribeCtx = null;
 let micTranscribeProcessor = null;
 let micTranscribeSource = null;
@@ -57,6 +62,16 @@ let micTranscribeTimer = null;
 let micPcmBuffer = [];
 let micPcmSampleRate = 48000;
 
+/** Latest insight keywords from the server; shown in the on-page overlay right panel. */
+let lastOverlayInsight =
+  'Reference hints appear here when speech matches your brief.';
+const OVERLAY_RIGHT_TEXT_ID = 'obli-overlay-right-text';
+const OVERLAY_RIGHT_HEARD_ID = 'obli-overlay-right-heard';
+const OVERLAY_LISTENING_BAR_ID = 'obli-overlay-listening-bar';
+/** Tab id where the overlay was last shown; fixes tab resolution from the extension popup. */
+let overlayInsightTabId = null;
+/** Last finalized transcript shown at top of RHS overlay (red) so the user sees we are listening. */
+let lastOverlayHeardSentence = 'Listening…';
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +130,16 @@ function ensureQueue(label) {
   if (!transcribeBuffers[label]) transcribeBuffers[label] = [];
 }
 
+function pcmSamplesRms(samples) {
+  if (!samples || !samples.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const x = samples[i];
+    sum += x * x;
+  }
+  return Math.sqrt(sum / samples.length);
+}
+
 function enqueueTranscriptionChunk(label, blob, mimeType) {
   if (!blob || blob.size === 0) return;
   if (!transcribeConfig.enabled) return;
@@ -128,15 +153,21 @@ function enqueueTranscriptionChunk(label, blob, mimeType) {
   transcribeBuffers[label].push(blob);
   const totalBytes = transcribeBuffers[label].reduce((sum, b) => sum + (b?.size || 0), 0);
 
+  const mt = mimeType || blob.type || 'audio/webm';
+
   if (totalBytes >= TRANSCRIBE_MIN_BYTES) {
-    flushTranscriptionBuffer(label, mimeType);
+    if (transcribeTimers[label]) {
+      clearTimeout(transcribeTimers[label]);
+      transcribeTimers[label] = null;
+    }
+    flushTranscriptionBuffer(label, mt);
     return;
   }
 
   if (!transcribeTimers[label]) {
     transcribeTimers[label] = setTimeout(() => {
       transcribeTimers[label] = null;
-      flushTranscriptionBuffer(label, mimeType);
+      flushTranscriptionBuffer(label, mt);
     }, TRANSCRIBE_MAX_INTERVAL_MS);
   }
 }
@@ -191,8 +222,10 @@ function encodeWav(samples, sampleRate) {
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
-function flushMicPcm(label) {
+function flushMicPcm(label = 'mic', options = {}) {
+  const tail = options.tail === true;
   if (!micPcmBuffer.length) return;
+
   const mergedLen = micPcmBuffer.reduce((sum, b) => sum + b.length, 0);
   const merged = new Float32Array(mergedLen);
   let offset = 0;
@@ -202,10 +235,8 @@ function flushMicPcm(label) {
   });
   micPcmBuffer = [];
 
-  const rms = lastRmsByLabel[label] ?? 0;
-  if (rms < TRANSCRIBE_MIN_RMS) {
-    return;
-  }
+  const mergedRms = pcmSamplesRms(merged);
+  if (mergedRms < TRANSCRIBE_MIN_RMS && !tail) return;
 
   const downsampled = downsampleBuffer(merged, micPcmSampleRate, 16000);
   const wavBlob = encodeWav(downsampled, 16000);
@@ -214,6 +245,8 @@ function flushMicPcm(label) {
 
 function startMicTranscription(stream) {
   if (micTranscribeCtx) return;
+  micPcmBuffer = [];
+
   micTranscribeCtx = new AudioContext();
   micPcmSampleRate = micTranscribeCtx.sampleRate;
   micTranscribeSource = micTranscribeCtx.createMediaStreamSource(stream);
@@ -234,7 +267,7 @@ function stopMicTranscription() {
     clearInterval(micTranscribeTimer);
     micTranscribeTimer = null;
   }
-  flushMicPcm('mic');
+  flushMicPcm('mic', { tail: true });
   if (micTranscribeProcessor) {
     micTranscribeProcessor.disconnect();
     micTranscribeProcessor = null;
@@ -249,28 +282,35 @@ function stopMicTranscription() {
   }
 }
 
-function flushTranscriptionBuffer(label, mimeType) {
+function flushTranscriptionBuffer(label, mimeType, options = {}) {
+  const force = options.force === true;
+  if (transcribeTimers[label]) {
+    clearTimeout(transcribeTimers[label]);
+    transcribeTimers[label] = null;
+  }
+
   ensureQueue(label);
   const parts = transcribeBuffers[label];
-  if (!parts || parts.length === 0) return;
+  if (!parts?.length) return;
 
-  const combined = new Blob(parts, { type: mimeType || parts[0]?.type || 'audio/webm' });
+  const inferredType = mimeType || parts[0]?.type || 'audio/webm';
+  const combined = new Blob(parts, { type: inferredType });
+
+  if (!force && combined.size < TRANSCRIBE_MIN_BYTES) {
+    transcribeTimers[label] = setTimeout(() => {
+      transcribeTimers[label] = null;
+      flushTranscriptionBuffer(label, inferredType);
+    }, TRANSCRIBE_MAX_INTERVAL_MS);
+    return;
+  }
+
   transcribeBuffers[label] = [];
-
-  if (combined.size < TRANSCRIBE_MIN_BYTES) {
-    return;
-  }
-
-  const rms = lastRmsByLabel[label] ?? 0;
-  if (rms < TRANSCRIBE_MIN_RMS) {
-    return;
-  }
 
   transcribeSeq[label] += 1;
   transcribeQueues[label].push({
     seq: transcribeSeq[label],
     blob: combined,
-    mimeType: combined.type || 'audio/webm',
+    mimeType: combined.type || inferredType || 'audio/webm',
     ts: Date.now(),
   });
   drainTranscriptionQueue(label);
@@ -321,7 +361,11 @@ async function drainTranscriptionQueue(label) {
       log(`Transcription error ${res.status}: ${errText}`, 'log-error');
     } else {
       const data = await res.json();
+      const spoken = (data.text || '').trim();
       appendTranscriptLine(label, data.text || '', data.isFinal ? 'final' : 'partial');
+      if (spoken) updateOverlayRightPanelHeard(spoken);
+      const insight = data.insight != null ? String(data.insight).trim() : '';
+      if (insight) updateOverlayRightPanelInsight(insight);
       setTranscribeStatus('Idle');
     }
   } catch (err) {
@@ -389,6 +433,17 @@ function normalizeCaptureError(err, step) {
   }
 
   if (step === 'tab_audio') {
+    if (
+      message.includes('active stream') ||
+      message.includes('Cannot capture a tab') ||
+      message.includes('tab with an active stream')
+    ) {
+      return [
+        'This tab already has tab audio capture open (or a second Start ran while the first was still setting up).',
+        'Click Stop in the extension, wait a second, then click Start once.',
+        'If it persists, refresh the page you are capturing and try again.',
+      ].join(' ');
+    }
     if (name === 'PermissionDeniedError' || name === 'NotAllowedError') {
       return 'Tab audio capture was denied. Keep the target tab active and try Start again.';
     }
@@ -620,6 +675,13 @@ function finalizeRecordings() {
 // ── Start / Stop ──────────────────────────────────────────────────────────────
 
 async function startCapture() {
+  if (captureStartInFlight) {
+    log('Setup already in progress — wait for it to finish or click Stop.', 'log-audio');
+    return;
+  }
+  captureStartInFlight = true;
+  startBtn.disabled = true;
+
   let currentStep = 'initialization';
   try {
     const micPermissionState = await getMicPermissionState();
@@ -629,6 +691,7 @@ async function startCapture() {
         'Open Chrome site settings for this extension and allow Microphone, then retry.',
         'log-error'
       );
+      startBtn.disabled = false;
       return;
     }
     if (micPermissionState === 'prompt') {
@@ -712,13 +775,14 @@ async function startCapture() {
       attachRecorder(new MediaStream(sysAudioTracks), 'system_audio');
     }
 
-    startBtn.disabled = true;
     stopBtn.disabled  = false;
     log('All sources active.', 'log-audio');
   } catch (err) {
     console.error(err);
     cleanupPartialCapture();
     log('Error: ' + normalizeCaptureError(err, currentStep), 'log-error');
+  } finally {
+    captureStartInFlight = false;
   }
 }
 
@@ -730,7 +794,7 @@ async function stopCapture() {
     recorders = [];
 
     Object.keys(transcribeBuffers).forEach((label) => {
-      flushTranscriptionBuffer(label);
+      flushTranscriptionBuffer(label, undefined, { force: true });
     });
 
     finalizeRecordings();
@@ -767,8 +831,82 @@ async function stopCapture() {
   }
 }
 
+/**
+ * Resolve the browser tab the user is likely looking at. `currentWindow` from a toolbar
+ * popup often points at the wrong window; `lastFocusedWindow` matches the main browser window.
+ */
+function runOnActiveWebTab(callback) {
+  if (isDetachedWindow && Number.isInteger(sourceTabId) && sourceTabId > 0) {
+    chrome.tabs.get(sourceTabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) return;
+      callback(tab);
+    });
+    return;
+  }
+  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => callback(tabs?.[0]));
+}
+
+/** Prefer the tab where the overlay is injected so live insights hit the right page. */
+function runOnInsightTargetTab(callback) {
+  if (Number.isInteger(overlayInsightTabId) && overlayInsightTabId > 0) {
+    chrome.tabs.get(overlayInsightTabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        overlayInsightTabId = null;
+        runOnActiveWebTab(callback);
+        return;
+      }
+      callback(tab);
+    });
+    return;
+  }
+  runOnActiveWebTab(callback);
+}
+
+function injectOverlayTextById(tabId, tabUrl, elementId, content) {
+  if (!Number.isInteger(tabId)) return;
+  if (
+    tabUrl.startsWith('chrome://') ||
+    tabUrl.startsWith('chrome-extension://') ||
+    tabUrl.startsWith('edge://') ||
+    tabUrl.startsWith('about:')
+  ) {
+    return;
+  }
+  chrome.scripting.executeScript(
+    {
+      target: { tabId },
+      func: (id, next) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = next;
+      },
+      args: [elementId, content],
+    },
+    () => {
+      void chrome.runtime.lastError;
+    }
+  );
+}
+
+/** Red line at top of RHS — latest transcribed sentence (confirms audio path is live). */
+function updateOverlayRightPanelHeard(sentence) {
+  const text = String(sentence || '').trim() || 'Listening…';
+  lastOverlayHeardSentence = text;
+  runOnInsightTargetTab((tab) => {
+    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_HEARD_ID, text);
+  });
+}
+
+function updateOverlayRightPanelInsight(insightText) {
+  const text = String(insightText || '').trim();
+  if (!text) return;
+  lastOverlayInsight = text;
+  runOnInsightTargetTab((tab) => {
+    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_TEXT_ID, text);
+  });
+}
+
 function openDetachedWindow() {
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
     const activeId = tabs?.[0]?.id;
     const query = Number.isInteger(activeId) && activeId > 0
       ? `?mode=window&sourceTabId=${activeId}`
@@ -789,6 +927,7 @@ function openDetachedWindow() {
 function toggleOverlay() {
   const withTargetTab = (activeTab) => {
     const tabId = activeTab?.id;
+    const capturedTabId = tabId;
     if (!Number.isInteger(tabId)) {
       log('No active tab found for overlay preview.', 'log-error');
       return;
@@ -810,7 +949,7 @@ function toggleOverlay() {
     chrome.scripting.executeScript(
       {
         target: { tabId },
-        func: (overlayTextLeft, overlayTextRight) => {
+        func: (overlayTextLeft, overlayTextRight, rightTextId, heardTextId, heardInitial, listeningBarId) => {
           const OVERLAY_ID = 'obli-overlay-poc';
           const existing = document.getElementById(OVERLAY_ID);
           if (existing) {
@@ -824,9 +963,37 @@ function toggleOverlay() {
             position: 'fixed',
             inset: '0',
             zIndex: '2147483647',
+            display: 'flex',
+            flexDirection: 'column',
+            pointerEvents: 'none',
+          });
+
+          const listeningBar = document.createElement('div');
+          listeningBar.id = listeningBarId;
+          listeningBar.textContent = 'Listening';
+          Object.assign(listeningBar.style, {
+            flex: '0 0 auto',
+            width: '100%',
+            padding: '8px 16px',
+            boxSizing: 'border-box',
+            background: 'rgba(0, 0, 0, 0.72)',
+            color: 'rgba(255, 255, 255, 0.95)',
+            fontFamily: 'Arial, sans-serif',
+            fontSize: '11px',
+            fontWeight: '700',
+            letterSpacing: '0.22em',
+            textTransform: 'uppercase',
+            textAlign: 'center',
+            borderBottom: '1px solid rgba(255, 255, 255, 0.12)',
+            boxShadow: '0 4px 16px rgba(0, 0, 0, 0.35)',
+          });
+
+          const gridShell = document.createElement('div');
+          Object.assign(gridShell.style, {
+            flex: '1',
+            minHeight: '0',
             display: 'grid',
             gridTemplateColumns: '20vw 1fr 20vw',
-            pointerEvents: 'none',
           });
 
           const leftPanel = document.createElement('div');
@@ -854,6 +1021,8 @@ function toggleOverlay() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
+            padding: '12px',
+            boxSizing: 'border-box',
           });
 
           const textBaseStyle = {
@@ -873,19 +1042,69 @@ function toggleOverlay() {
           leftTextBox.textContent = overlayTextLeft;
           Object.assign(leftTextBox.style, textBaseStyle);
 
+          const rightColumn = document.createElement('div');
+          Object.assign(rightColumn.style, {
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'stretch',
+            justifyContent: 'center',
+            gap: '10px',
+            maxWidth: '100%',
+            width: '100%',
+          });
+
+          const heardLine = document.createElement('div');
+          heardLine.id = heardTextId;
+          heardLine.textContent = heardInitial;
+          Object.assign(heardLine.style, {
+            ...textBaseStyle,
+            color: '#ff5252',
+            fontSize: 'clamp(12px, 1.15vw, 18px)',
+            fontWeight: '600',
+            letterSpacing: '0.01em',
+            padding: '10px 14px',
+            textAlign: 'left',
+            borderLeft: '3px solid #ff5252',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            lineHeight: '1.35',
+          });
+
           const rightTextBox = document.createElement('div');
+          rightTextBox.id = rightTextId;
           rightTextBox.textContent = overlayTextRight;
-          Object.assign(rightTextBox.style, textBaseStyle);
+          Object.assign(rightTextBox.style, textBaseStyle, {
+            maxWidth: '100%',
+            fontSize: 'clamp(13px, 1.25vw, 22px)',
+            lineHeight: '1.35',
+            fontWeight: '600',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            hyphens: 'auto',
+            textAlign: 'left',
+          });
+
+          rightColumn.appendChild(heardLine);
+          rightColumn.appendChild(rightTextBox);
 
           leftPanel.appendChild(leftTextBox);
-          rightPanel.appendChild(rightTextBox);
-          overlay.appendChild(leftPanel);
-          overlay.appendChild(centerPanel);
-          overlay.appendChild(rightPanel);
+          rightPanel.appendChild(rightColumn);
+          gridShell.appendChild(leftPanel);
+          gridShell.appendChild(centerPanel);
+          gridShell.appendChild(rightPanel);
+          overlay.appendChild(listeningBar);
+          overlay.appendChild(gridShell);
           document.body.appendChild(overlay);
           return { state: 'added' };
         },
-        args: ['Add some text here', 'Add some text here'],
+        args: [
+          'Obli',
+          lastOverlayInsight,
+          OVERLAY_RIGHT_TEXT_ID,
+          OVERLAY_RIGHT_HEARD_ID,
+          lastOverlayHeardSentence,
+          OVERLAY_LISTENING_BAR_ID,
+        ],
       },
       (results) => {
         if (chrome.runtime.lastError) {
@@ -905,8 +1124,10 @@ function toggleOverlay() {
         }
         const state = results?.[0]?.result?.state;
         if (state === 'added') {
+          overlayInsightTabId = capturedTabId;
           log('Transparent overlay preview shown on active tab.', 'log-screen');
         } else if (state === 'removed') {
+          overlayInsightTabId = null;
           log('Transparent overlay preview removed.', 'log-screen');
         }
       }
@@ -928,7 +1149,7 @@ function toggleOverlay() {
     return;
   }
 
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
     withTargetTab(tabs?.[0]);
   });
 }

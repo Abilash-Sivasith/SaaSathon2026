@@ -339,6 +339,7 @@ async function drainTranscriptionQueue(label) {
       if (spoken) lastSpokenText = spoken;
       const insight = data.insight != null ? String(data.insight).trim() : '';
       if (insight) updateOverlayRightPanelInsight(insight);
+      if (data.coach) applySpeechCoachingResult(data.coach);
     }
   } catch (err) {
     log(`Transcription network error: ${err?.message || err}`, 'log-error');
@@ -581,7 +582,7 @@ function captureFrame() {
 
 function normalizeFaceState(state) {
   const normalized = String(state || 'neutral').toLowerCase();
-  return ['bored', 'neutral', 'engaged'].includes(normalized) ? normalized : 'neutral';
+  return ['bored', 'neutral', 'engaged', 'warning'].includes(normalized) ? normalized : 'neutral';
 }
 
 function normalizeFaceConfidence(confidence) {
@@ -599,24 +600,31 @@ function formatFaceFeedback(state, reason, feedbackText, confidence = 0.5) {
     return { state: normalized, confidence: normalizedConfidence, text: feedbackText };
   }
 
+  if (normalized === 'warning') {
+    return {
+      state: 'warning',
+      confidence: normalizedConfidence,
+      text: 'Tone down.',
+    };
+  }
   if (normalized === 'bored') {
     return {
       state: 'bored',
       confidence: normalizedConfidence,
-      text: `Coach: you are looking away and it feels like you are distracted. Come back to the main screen.${reasonText}`,
+      text: `Look back.${reasonText}`,
     };
   }
   if (normalized === 'engaged') {
     return {
       state: 'engaged',
       confidence: normalizedConfidence,
-      text: `Coach: good focus. You are on the right track. Keep it up.${reasonText}`,
+      text: `Good focus.${reasonText}`,
     };
   }
   return {
     state: 'neutral',
     confidence: normalizedConfidence,
-    text: `Coach: you are almost there. Keep going and focus a bit more.${reasonText}`,
+    text: `Stay focused.${reasonText}`,
   };
 }
 
@@ -694,12 +702,35 @@ function resetFaceFeedbackSmoothing() {
 
 function applyFaceAnalysisResult(face) {
   if (!face) return;
+  if (normalizeFaceState(face.state) === 'warning') {
+    applySpeechCoachingResult(face);
+    return;
+  }
   const stableFeedback = computeStableFaceFeedback(face);
   const now = Date.now();
   if (stableFeedback.shouldUpdate && now - lastFeedbackUpdateTs >= FEEDBACK_UPDATE_INTERVAL_MS) {
     lastFeedbackUpdateTs = now;
     updateOverlayLeftFeedback(stableFeedback.text, stableFeedback.state);
   }
+}
+
+function applySpeechCoachingResult(coach) {
+  if (!coach) return;
+  const feedback = formatFaceFeedback(
+    coach.state || 'warning',
+    coach.reason || '',
+    coach.feedback || 'Tone down.',
+    coach.confidence ?? 0.95
+  );
+  acceptedFaceFeedback = {
+    state: 'warning',
+    text: feedback.text,
+    confidence: feedback.confidence,
+  };
+  feedbackHistory.push(acceptedFaceFeedback);
+  if (feedbackHistory.length > FEEDBACK_HISTORY_SIZE) feedbackHistory.shift();
+  lastFeedbackUpdateTs = Date.now();
+  updateOverlayLeftFeedback(feedback.text, 'warning');
 }
 
 function captureAndStoreFaceFrame() {
@@ -1084,7 +1115,7 @@ function setOverlayLeftFeedbackColor(tabId, tabUrl, state) {
   }
   const color = state === 'engaged'
     ? '#5fe075'
-    : state === 'bored'
+    : state === 'bored' || state === 'warning'
       ? '#ff6b6b'
       : '#ffd54f';
   chrome.scripting.executeScript(

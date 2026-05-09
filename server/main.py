@@ -971,9 +971,8 @@ TRANSCRIBE_LANGUAGE_HINT: str | None = None if _tl_hint == "auto" else (_tl_hint
 TRANSCRIBE_PROMPT = os.getenv(
     "OPENAI_TRANSCRIBE_PROMPT",
     (
-        "English sales meeting. Preserve exact proper nouns, product names, and money amounts. "
-        "Domain terms: Justus Huneke, Oblique, Lumin PDF, Lumin Sign, Holdco, John Doe, "
-        "$100k, $20k, $100 per month per user, Cloudflare Workers, TypeScript, ALF Dashboard."
+        "Transcribe only the words actually spoken. Do not add introductions, summaries, or corporate updates. "
+        "Spelling hints only: Justus Huneke; Oblique; Lumin PDF; Lumin Sign; Holdco; John Doe."
     ),
 ).strip()
 
@@ -992,6 +991,15 @@ TRANSCRIBE_AUDIO_FILTERS = os.getenv(
 FACE_MODEL = os.getenv("OPENAI_FACE_MODEL", "gpt-4o-mini")
 FACE_DISABLED = os.getenv("FACE_DISABLED", "0").strip().lower() in ("1", "true", "yes")
 FACE_IMAGE_MAX_BYTES = int(os.getenv("FACE_IMAGE_MAX_BYTES", "1500000"))
+COACH_RAISED_VOICE_RMS = float(os.getenv("COACH_RAISED_VOICE_RMS", "0.035"))
+COACH_OFFENSIVE_WORDS = {
+    word.strip().lower()
+    for word in os.getenv(
+        "COACH_OFFENSIVE_WORDS",
+        "fuck,shit,bitch,asshole,bastard,dick,cunt,damn,crap,slut,whore",
+    ).split(",")
+    if word.strip()
+}
 
 STRIP_FILLER_WORDS = os.getenv("STRIP_FILLER_WORDS", "1").strip().lower() not in ("0", "false", "no")
 TRANSCRIPT_MIN_LATIN_RATIO = float(os.getenv("TRANSCRIPT_MIN_LATIN_RATIO", "0.7"))
@@ -999,7 +1007,8 @@ TRANSCRIPT_PROMPT_LEAK_MIN_TERMS = int(os.getenv("TRANSCRIPT_PROMPT_LEAK_MIN_TER
 TRANSCRIPT_PROMPT_LEAK_TERMS = {
     "oblique", "lumin pdf", "lumin sign", "justus huneke", "holdco", "john doe",
     "pricing", "discount", "refund", "software", "integration", "pdf signing", "ai",
-    "english sales meeting", "proper nouns", "names:",
+    "transcribe only", "spelling hints", "english sales meeting", "proper nouns", "names:",
+    "cloudflare workers", "typescript", "alf dashboard",
 }
 
 # Hesitations / discourse markers unlikely to carry meaning when removed as whole-word matches.
@@ -1050,8 +1059,23 @@ def transcript_looks_like_prompt_leak(text: str) -> bool:
 
     hits = sum(1 for term in TRANSCRIPT_PROMPT_LEAK_TERMS if has_term(term))
     comma_count = text.count(",")
+    word_count = len(text.split())
+    hallucination_markers = (
+        "hello everyone",
+        "today i'll be discussing",
+        "today i will be discussing",
+        "recent progress",
+        "looking ahead",
+        "thank you for your continued support",
+        "we are proud to report",
+        "significant milestone",
+    )
+    if hits >= 5 and word_count >= 45 and any(marker in lower for marker in hallucination_markers):
+        return True
+    if hits >= 7 and word_count >= 80:
+        return True
     return hits >= TRANSCRIPT_PROMPT_LEAK_MIN_TERMS or (
-        hits >= 5 and comma_count >= 4 and len(text.split()) <= 30
+        hits >= 5 and comma_count >= 4 and word_count <= 30
     )
 
 
@@ -1110,6 +1134,42 @@ def clean_transcript_text(text: str) -> str:
         logger.debug("ignored transcript chunk that looks like prompt leak: %r", cleaned[:120])
         return ""
     return cleaned
+
+
+def transcript_has_offensive_language(text: str) -> bool:
+    if not text or not COACH_OFFENSIVE_WORDS:
+        return False
+    lower = text.lower()
+    return any(
+        re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", lower)
+        for word in COACH_OFFENSIVE_WORDS
+    )
+
+
+def build_speech_coaching(
+    text: str | None,
+    audio_rms: Optional[float] = None,
+) -> dict[str, object] | None:
+    """Deterministic live coaching for language/tone before visual smoothing."""
+    offensive = transcript_has_offensive_language(text or "")
+    raised_voice = isinstance(audio_rms, (int, float)) and audio_rms >= COACH_RAISED_VOICE_RMS
+    if not offensive and not raised_voice:
+        return None
+    if offensive and raised_voice:
+        feedback = "Tone down."
+        reason = "language and volume"
+    elif offensive:
+        feedback = "Tone down."
+        reason = "offensive wording"
+    else:
+        feedback = "Lower voice."
+        reason = "raised voice"
+    return {
+        "state": "warning",
+        "confidence": 0.95,
+        "reason": reason,
+        "feedback": feedback,
+    }
 
 
 def transcribe_then_clean(
@@ -1317,7 +1377,7 @@ def _parse_face_response(raw: str) -> dict[str, object]:
             return {"state": "neutral", "confidence": 0.5, "reason": "parse_failed", "feedback": ""}
 
     state = str(data.get("state", "neutral")).strip().lower()
-    if state not in ("bored", "neutral", "engaged"):
+    if state not in ("bored", "neutral", "engaged", "warning"):
         state = "neutral"
 
     confidence = data.get("confidence", 0.5)
@@ -1339,6 +1399,10 @@ def analyze_face_image(
     audio_rms: Optional[float] = None,
     recent_transcript: Optional[str] = None,
 ) -> dict[str, object]:
+    speech_coaching = build_speech_coaching(recent_transcript, audio_rms)
+    if speech_coaching:
+        return speech_coaching
+
     client = OpenAI(api_key=api_key)
     data_url = f"data:{mime_type};base64,{image_b64}"
     audio_tone = "unknown"
@@ -1352,11 +1416,11 @@ def analyze_face_image(
     prompt = (
         "Classify visible meeting engagement using only observable cues from the face image, "
         "recent transcript, and audio tone. Output JSON only with keys: state, confidence, reason, feedback. "
-        "state must be bored|neutral|engaged. confidence is 0-1. "
+        "state must be bored|neutral|engaged|warning. Use warning only for raised voice or unprofessional language. confidence is 0-1. "
         "Use lower confidence (0.2-0.45) when the face is unclear, occluded, off-camera, or the cue is ambiguous. "
         "reason is 2-6 words describing visible cues only. "
-        "feedback is one very short coaching action under 12 words. Start it with 'Coach:'. "
-        "Use direct visible behavior, e.g. 'Coach: Look back at the screen.' "
+        "feedback is one very short coaching action under 4 words. "
+        "Use direct visible behavior, e.g. 'Look back.' "
         "Avoid diagnosing emotions or personality; coach the next visible behavior instead. "
         "No extra text."
     )
@@ -1371,7 +1435,7 @@ def analyze_face_image(
             {
                 "role": "system",
                 "content": (
-                    "You are a conservative visual engagement coach. "
+                    "You are a conservative visual engagement and speech-tone coach. "
                     "Prefer neutral with modest confidence when evidence is weak. "
                     "Keep feedback short enough for a live overlay."
                 ),
@@ -1498,7 +1562,11 @@ async def _run_transcription(payload: IngestIn, api_key: str) -> dict[str, objec
         elif not insight:
             logger.warning("insight model returned an empty reply (model=%s)", INSIGHT_MODEL)
 
-    return {"ok": True, "isFinal": True, "text": text, "insight": insight_reply}
+    response: dict[str, object] = {"ok": True, "isFinal": True, "text": text, "insight": insight_reply}
+    speech_coaching = build_speech_coaching(text, payload.audioRms)
+    if speech_coaching:
+        response["coach"] = speech_coaching
+    return response
 
 
 async def _run_face_analysis(payload: IngestIn, api_key: str) -> dict[str, object]:

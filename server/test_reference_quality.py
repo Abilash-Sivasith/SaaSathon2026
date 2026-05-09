@@ -345,6 +345,19 @@ CASES = [
         "expected": [],
         "forbidden": ["$100", "$20k", "$100k", "Holdco", "Justus"],
     },
+    {
+        "name": "long_corporate_hallucination_no_match",
+        "utterance": (
+            "Hello everyone, this is John Doe, CEO of Justus Huneke and Oblique. "
+            "Today, I'll be discussing our recent progress with Lumin PDF, Lumin Sign, and Holdco. "
+            "We have made great strides with Cloudflare Workers and TypeScript integrations. "
+            "We are proud to report $100k in revenue and a $20k investment. "
+            "Looking ahead, thank you for your continued support."
+        ),
+        "category": "no_match",
+        "expected": [],
+        "forbidden": ["$100", "$20k", "$100k", "Holdco", "Justus", "Oblique"],
+    },
 ]
 
 
@@ -520,8 +533,50 @@ def run_case(case: dict[str, object]) -> dict[str, object]:
     }
 
 
+COACH_CASES = [
+    {
+        "name": "offensive_language_warning",
+        "text": "That was a bad damn answer.",
+        "audio_rms": 0.01,
+        "expected_state": "warning",
+        "expected": ["Tone down"],
+    },
+    {
+        "name": "raised_voice_warning",
+        "text": "Can we talk about the price?",
+        "audio_rms": main.COACH_RAISED_VOICE_RMS + 0.01,
+        "expected_state": "warning",
+        "expected": ["Lower voice"],
+    },
+    {
+        "name": "normal_speech_no_warning",
+        "text": "Can we talk about the price?",
+        "audio_rms": 0.01,
+        "expected_state": None,
+        "expected": [],
+    },
+]
+
+
+def run_coach_case(case: dict[str, object]) -> dict[str, object]:
+    coach = main.build_speech_coaching(str(case["text"]), float(case["audio_rms"]))
+    expected_state = case["expected_state"]
+    expected = [str(item) for item in case["expected"]]
+    text = str(coach.get("feedback", "")) if coach else ""
+    missing = [item for item in expected if item.lower() not in text.lower()]
+    state_mismatch = (coach or {}).get("state") != expected_state if expected_state else coach is not None
+    return {
+        **case,
+        "coach": coach,
+        "missing": missing,
+        "state_mismatch": state_mismatch,
+        "passed": not missing and not state_mismatch,
+    }
+
+
 def main_entry() -> int:
     results = [run_case(case) for case in CASES]
+    coach_results = [run_coach_case(case) for case in COACH_CASES]
     verbose = os.getenv("REFERENCE_TEST_VERBOSE", "0").strip().lower() in ("1", "true", "yes")
 
     labels = sorted({str(r["category"]) for r in results} | {str(r["predicted_category"]) for r in results})
@@ -564,7 +619,22 @@ def main_entry() -> int:
             print(f"  category mismatch: expected {result['category']}, got {result['predicted_category']}")
 
     print(f"\nPassed {len(results) - failures}/{len(results)} cases")
-    return 1 if failures else 0
+
+    print("\nSpeech coaching cases")
+    coach_failures = 0
+    for result in coach_results:
+        status = "PASS" if result["passed"] else "FAIL"
+        if not result["passed"]:
+            coach_failures += 1
+        if verbose or not result["passed"]:
+            print(f"{status} {result['name']}: {result['coach'] or '<no coach>'}")
+        if result["missing"]:
+            print(f"  missing: {result['missing']}")
+        if result["state_mismatch"]:
+            print(f"  state mismatch: expected {result['expected_state']}")
+    print(f"Passed {len(coach_results) - coach_failures}/{len(coach_results)} coaching cases")
+
+    return 1 if failures or coach_failures else 0
 
 
 if __name__ == "__main__":

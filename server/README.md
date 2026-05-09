@@ -42,6 +42,8 @@ OPENAI_TRANSCRIBE_PROMPT="English sales meeting. Preserve exact proper nouns, pr
 OPENAI_TRANSCRIBE_NORMALIZE_AUDIO=1 # high/low pass + loudness normalization before STT
 OPENAI_TRANSCRIBE_AUDIO_FILTERS="highpass=f=80,lowpass=f=7600,loudnorm=I=-18:TP=-2:LRA=11"
 OPENAI_TRANSCRIBE_SAMPLE_RATE=16000
+COACH_RAISED_VOICE_RMS=0.035      # visual cue turns red when recent mic level is above this
+COACH_OFFENSIVE_WORDS="..."       # comma-separated words that trigger "tone it down" coaching
 TRANSCRIPT_MIN_LATIN_RATIO=0.7     # filters likely auto-detect drift/noise
 INSIGHT_REFERENCE_TOP_K=4          # max retrieved chunks
 INSIGHT_REFERENCE_MAX_CHARS=1200   # prompt budget for retrieved facts
@@ -57,6 +59,8 @@ INSIGHT_TRANSCRIPT_CONTEXT_CHARS=8000
 For best accuracy, keep facts in short headed sections or bullets, avoid mixing unrelated topics in one bullet, and put exact product/person names in the reference text. The overlay keeps the last useful cue on screen and shows up to three ranked facts, like `#1 | $100/mo/user | Oblique | realtime coaching` or `#2 | discount: ask 50% | settle 20% | be strict`. Vague follow-ups such as "how much is it?" use recent transcript context to find the closest reference match. Common ASR misses for domain words are normalized, and close token matches are checked against the reference vocabulary.
 
 For the clearest transcripts, leave `OPENAI_TRANSCRIBE_QUALITY=clarity` so the server uses `gpt-4o-transcribe`. For lower latency, set `OPENAI_TRANSCRIBE_QUALITY=realtime` or explicitly set `OPENAI_MODEL=gpt-4o-mini-transcribe`.
+
+Speech coaching is deterministic and fast: offensive wording or raised voice returns a `warning` coach event, so the overlay's visual feedback turns red with a short cue like `Tone down.` or `Lower voice.` Long fake corporate-update transcripts full of prompt/domain terms are filtered as transcription hallucinations.
 
 The extension uses two independent throttles:
 

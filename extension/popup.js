@@ -45,10 +45,11 @@ let transcribeConfig = {
   enabled: true,
 };
 
-const TRANSCRIBE_MIN_BYTES = 64000;
-const TRANSCRIBE_MAX_INTERVAL_MS = 8000;
+// WebM chunks must exceed the server's minimum wav conversion size; WAV (mic PCM) ignores that limit.
+const TRANSCRIBE_MIN_BYTES = 44000;
+const TRANSCRIBE_MAX_INTERVAL_MS = 3200;
 const TRANSCRIBE_MIN_RMS = 0.002;
-const TRANSCRIBE_PCM_INTERVAL_MS = 5000;
+const TRANSCRIBE_PCM_INTERVAL_MS = 2800;
 let micTranscribeCtx = null;
 let micTranscribeProcessor = null;
 let micTranscribeSource = null;

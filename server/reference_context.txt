@@ -8,33 +8,47 @@ infers relevance from spoken transcript.
 Goals for the assistant (edit as needed):
 - Keywords only — e.g. price talk → something like: $100 · max discount 20% (not prose).
 - When nothing matches: assistant prints ok (skipped in logs).
-- if the user asks about infomation provide that to them
+- if the user asks about information provide that to them
 
 # In Meeting context
 - Meeting with Justus. Has bought software from us 1 year ago.
 - About Justus's previous purchases
     - spend 20k on Lumin PDF, Lumin Sign
-    - has had a history of being happy with product, except for when thier was a cloud outage in november 2024, causing him to be angry and wanting a refund. 
-    - Tought negotiator, asks for large discounts (upto 50% off) but settles for 20% as long as you are strict. 
+    - has had a history of being happy with product, except for when there was a cloud outage in November 2024, causing him to be angry and wanting a refund.
+    - Tough negotiator, asks for large discounts (up to 50% off) but settles for 20% as long as you are strict.
 - Oblique (New product)
-    - description: A sales team trainer, and intelligence platform providing real time infomation, and feedback for the sales teams in real time.
+    - description: A sales team trainer, and intelligence platform providing real time information and feedback for sales teams.
     - costs $100 per month per user
     - features include:
-        - real time infomation relevent for a Meeting based on what is being said.
+        - real time information relevant for a meeting based on what is being said.
         - real time feedback about sales techniques. 
 - Product includes PDF reading, signing, and AI Integration
-- Info about person you are talking too,
+- Info about person you are talking to
     - Justus Huneke
     - age 30
     - works for holdco
     - software engineer
     - has 3 kids
     - Good friends with Rocky
-    - works with John Doe, who is in the Integration team and bought 100k worth of software last year for his department. 
+    - works with John Doe, who is in the Integration team and bought 100k worth of software last year for his department.
+
+- Public website facts about jstEagle / Justus
+    - jstEagle likes making things, mostly web3 and websites.
+    - jstEagle is currently working on ALF Dashboard.
+    - Tools listed: TypeScript, Next.js, Cloudflare, Svelte, Python, Rust.
+    - Current stack: Next.js, TypeScript, Tailwind, Cloudflare Workers, Vercel, KV, Helius.
+    - Full Stack Engineer on AEP Life Form Project from 2024 to present.
+    - ALF work includes dashboards, on-chain data, indexing, dynamic display, efficiency and speed.
+    - Tutored math and computer science from 2023 to 2024.
+
+- Oblique demo verification scenario
+    - If Justus asks why Oblique fits him, mention web3, dashboards, speed, and technical sales coaching.
+    - If Justus asks about integrating Oblique, mention Cloudflare Workers, TypeScript, dashboards, and low-latency meeting hints.
+    - If Justus asks for proof, mention live key facts, visual coaching, and fast audio keywords.
 
 Meeting Plan:
 - Intro
-    - ask about family 
-    - kids, life 
+    - ask about family
+    - kids, life
     - hobbies
-- Talk about how Lumin software has been working for them prevoupsly
+- Talk about how Lumin software has been working for them previously

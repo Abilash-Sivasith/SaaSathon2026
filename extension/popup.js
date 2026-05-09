@@ -2,19 +2,11 @@ const startBtn  = document.getElementById('start');
 const stopBtn   = document.getElementById('stop');
 const popoutBtn = document.getElementById('popout');
 const overlayToggleBtn = document.getElementById('overlay-toggle');
-const logEl     = document.getElementById('log');
 const preview   = document.getElementById('screen-preview');
 const placeholder = document.getElementById('preview-placeholder');
 const barTab    = document.getElementById('bar-tab');
 const barMic    = document.getElementById('bar-mic');
 const barSys    = document.getElementById('bar-sys');
-const transcribeEndpointInput = document.getElementById('transcribe-endpoint');
-const transcribeKeyInput = document.getElementById('transcribe-key');
-const transcribeEnabledToggle = document.getElementById('transcribe-enabled');
-const transcribeStatusEl = document.getElementById('transcribe-status');
-const transcriptEl = document.getElementById('transcript');
-const faceEnabledToggle = document.getElementById('face-enabled');
-const faceStatusEl = document.getElementById('face-status');
 const urlParams = new URLSearchParams(window.location.search);
 const isDetachedWindow = urlParams.get('mode') === 'window';
 const sourceTabId = Number(urlParams.get('sourceTabId'));
@@ -27,13 +19,8 @@ let cameraStream  = null; // getUserMedia        (camera)
 let audioCtx      = null;
 let rafId         = null;
 let frameInterval = null;
-let recorders     = [];   // one MediaRecorder per stream
-let packetSeq     = 0;    // monotonic packet id for media chunks
-
 let eventSeq      = 0;
 let lastLevelLogTs = 0;
-let chunkStore     = {};
-let objectUrls     = [];
 let tabMonitorNodes = null;
 let captureStartInFlight = false;
 
@@ -44,25 +31,21 @@ const transcribeBuffers = {};
 /** label -> timeout id (fixed-interval flush fallback, no silence wait) */
 const transcribeTimers = {};
 const lastRmsByLabel = { tab: 0, mic: 0, system_audio: 0 };
-let transcribeConfig = {
-  endpoint: '',
-  apiKey: '',
-  enabled: true,
-};
+const INGEST_ENDPOINT = 'http://localhost:8000/ingest';
+const FACE_ENDPOINT = 'http://localhost:8000/face';
+const TRANSCRIBE_ENABLED = true;
+const FACE_ENABLED = true;
 
-let faceConfig = {
-  enabled: false,
-};
+// Audio throttle: fast path for live transcript + key-detail bullets.
+const AUDIO_MIN_CHUNK_BYTES = 25000;
+const AUDIO_MAX_WAIT_MS = 1600;
+const AUDIO_PCM_FLUSH_MS = 1200;
+const AUDIO_MAX_QUEUE_ITEMS = 1;
 
-// WebM must exceed server's minimum WAV convert size (~32KB). Larger thresholds → fewer, bigger transcript chunks (no silence/pause detection).
-const TRANSCRIBE_MIN_BYTES = 78000;
-// If we never reach MIN_BYTES (quiet tab), flush whatever we have after this wait.
-const TRANSCRIBE_MAX_INTERVAL_MS = 5000;
-// Mic PCM → WAV periodic flush (~4.5s of audio typical at 48k buffer growth).
-const TRANSCRIBE_PCM_INTERVAL_MS = 4500;
-
-const FACE_CAPTURE_INTERVAL_MS = 3000;
-const FEEDBACK_UPDATE_INTERVAL_MS = 3500;
+// Visual throttle: slower independent path for coaching, never blocks audio.
+const VISUAL_FRAME_CAPTURE_MS = 3000;
+const VISUAL_ANALYSIS_MS = 5000;
+const FEEDBACK_UPDATE_INTERVAL_MS = 2500;
 const FACE_JPEG_QUALITY = 0.6;
 const FACE_MAX_EDGE = 480;
 const FEEDBACK_HISTORY_SIZE = 7;
@@ -81,14 +64,14 @@ let micPcmSampleRate = 48000;
 
 /** Latest insight keywords from the server; shown in the on-page overlay right panel. */
 let lastOverlayInsight =
-  'Meeting notes appear here as people speak.';
+  'Key details appear here.';
 const OVERLAY_RIGHT_TEXT_ID = 'obli-overlay-right-text';
 const OVERLAY_RIGHT_HEARD_ID = 'obli-overlay-right-heard';
 const OVERLAY_LEFT_FEEDBACK_ID = 'obli-overlay-left-feedback';
 const OVERLAY_LISTENING_BAR_ID = 'obli-overlay-listening-bar';
 /** Tab id where the overlay was last shown; fixes tab resolution from the extension popup. */
 let overlayInsightTabId = null;
-/** Last finalized transcript shown at top of RHS overlay (red) so the user sees we are listening. */
+/** Last finalized transcript shown in red so the user can confirm what was heard. */
 let lastOverlayHeardSentence = 'Listening…';
 let lastOverlayFeedbackText = 'Coach: camera idle. Start when ready.';
 let lastOverlayFeedbackState = 'neutral';
@@ -99,83 +82,21 @@ let acceptedFaceFeedback = null;
 
 let cameraVideo = null;
 let faceInterval = null;
+let faceAnalysisInterval = null;
 const faceCanvas = document.createElement('canvas');
 const faceCtx = faceCanvas.getContext('2d');
 let lastFaceFrameB64 = '';
+let lastFaceAnalysisSentTs = 0;
+let faceAnalysisInFlight = false;
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 
 function log(msg, cls = '') {
-  const line = document.createElement('div');
-  if (cls) line.className = cls;
-  line.textContent = `[${new Date().toISOString().slice(11, 23)}] ${msg}`;
-  logEl.appendChild(line);
-  logEl.scrollTop = logEl.scrollHeight;
+  if (cls === 'log-error') {
+    console.error('[Logger]', msg);
+    return;
+  }
   console.log('[Logger]', msg);
-}
-
-function setTranscribeStatus(message, isError = false) {
-  transcribeStatusEl.textContent = message;
-  transcribeStatusEl.classList.toggle('error', Boolean(isError));
-}
-
-function setFaceStatus(message, isError = false) {
-  faceStatusEl.textContent = message;
-  faceStatusEl.classList.toggle('error', Boolean(isError));
-}
-
-function appendTranscriptLine(source, text, meta = '') {
-  if (!text) return;
-  const line = document.createElement('div');
-  line.className = 'transcript-line';
-  const stamp = new Date().toISOString().slice(11, 19);
-  const suffix = meta ? ` (${meta})` : '';
-  line.textContent = `[${stamp}] ${source}: ${text}${suffix}`;
-  transcriptEl.appendChild(line);
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
-}
-
-function loadTranscribeConfig() {
-  chrome.storage?.local?.get(['transcribeConfig'], (res) => {
-    if (res?.transcribeConfig) {
-      transcribeConfig = { ...transcribeConfig, ...res.transcribeConfig };
-    }
-    transcribeEndpointInput.value = transcribeConfig.endpoint || '';
-    transcribeKeyInput.value = transcribeConfig.apiKey || '';
-    transcribeEnabledToggle.checked = Boolean(transcribeConfig.enabled);
-    setTranscribeStatus(transcribeConfig.enabled ? 'Idle' : 'Disabled');
-  });
-}
-
-function saveTranscribeConfig() {
-  transcribeConfig = {
-    endpoint: transcribeEndpointInput.value.trim(),
-    apiKey: transcribeKeyInput.value.trim(),
-    enabled: Boolean(transcribeEnabledToggle.checked),
-  };
-  chrome.storage?.local?.set({ transcribeConfig }, () => {
-    setTranscribeStatus(transcribeConfig.enabled ? 'Saved' : 'Disabled');
-  });
-}
-
-function loadFaceConfig() {
-  chrome.storage?.local?.get(['faceConfig'], (res) => {
-    if (res?.faceConfig) {
-      faceConfig = { ...faceConfig, ...res.faceConfig };
-    }
-    faceEnabledToggle.checked = Boolean(faceConfig.enabled);
-    setFaceStatus(faceConfig.enabled ? 'Idle' : 'Disabled');
-  });
-}
-
-function saveFaceConfig() {
-  faceConfig = {
-    enabled: Boolean(faceEnabledToggle.checked),
-  };
-  if (!faceConfig.enabled) resetFaceFeedbackSmoothing();
-  chrome.storage?.local?.set({ faceConfig }, () => {
-    setFaceStatus(faceConfig.enabled ? 'Saved' : 'Disabled');
-  });
 }
 
 function ensureQueue(label) {
@@ -197,11 +118,7 @@ function pcmSamplesRms(samples) {
 
 function enqueueTranscriptionChunk(label, blob, mimeType) {
   if (!blob || blob.size === 0) return;
-  if (!transcribeConfig.enabled) return;
-  if (!transcribeConfig.endpoint) {
-    setTranscribeStatus('Missing endpoint URL', true);
-    return;
-  }
+  if (!TRANSCRIBE_ENABLED) return;
 
   ensureQueue(label);
 
@@ -210,7 +127,7 @@ function enqueueTranscriptionChunk(label, blob, mimeType) {
 
   const mt = mimeType || blob.type || 'audio/webm';
 
-  if (totalBytes >= TRANSCRIBE_MIN_BYTES) {
+  if (totalBytes >= AUDIO_MIN_CHUNK_BYTES) {
     if (transcribeTimers[label]) {
       clearTimeout(transcribeTimers[label]);
       transcribeTimers[label] = null;
@@ -223,7 +140,7 @@ function enqueueTranscriptionChunk(label, blob, mimeType) {
     transcribeTimers[label] = setTimeout(() => {
       transcribeTimers[label] = null;
       flushTranscriptionBuffer(label, mt);
-    }, TRANSCRIBE_MAX_INTERVAL_MS);
+    }, AUDIO_MAX_WAIT_MS);
   }
 }
 
@@ -314,7 +231,7 @@ function startMicTranscription(stream) {
   };
   micTranscribeTimer = setInterval(() => {
     flushMicPcm('mic');
-  }, TRANSCRIBE_PCM_INTERVAL_MS);
+  }, AUDIO_PCM_FLUSH_MS);
 }
 
 function stopMicTranscription() {
@@ -351,17 +268,20 @@ function flushTranscriptionBuffer(label, mimeType, options = {}) {
   const inferredType = mimeType || parts[0]?.type || 'audio/webm';
   const combined = new Blob(parts, { type: inferredType });
 
-  if (!force && combined.size < TRANSCRIBE_MIN_BYTES) {
+  if (!force && combined.size < AUDIO_MIN_CHUNK_BYTES) {
     transcribeTimers[label] = setTimeout(() => {
       transcribeTimers[label] = null;
       flushTranscriptionBuffer(label, inferredType);
-    }, TRANSCRIBE_MAX_INTERVAL_MS);
+    }, AUDIO_MAX_WAIT_MS);
     return;
   }
 
   transcribeBuffers[label] = [];
 
   transcribeSeq[label] += 1;
+  if (transcribeQueues[label].length > AUDIO_MAX_QUEUE_ITEMS) {
+    transcribeQueues[label].splice(0, transcribeQueues[label].length - AUDIO_MAX_QUEUE_ITEMS);
+  }
   transcribeQueues[label].push({
     seq: transcribeSeq[label],
     blob: combined,
@@ -378,7 +298,6 @@ async function drainTranscriptionQueue(label) {
 
   const item = queue.shift();
   transcribeInFlight[label] = true;
-  setTranscribeStatus(`Transcribing ${label} (chunk ${item.seq})`);
 
   const arrayBuffer = await item.blob.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
@@ -396,23 +315,15 @@ async function drainTranscriptionQueue(label) {
     chunkIndex: item.seq,
     ts: item.ts,
   };
-  payload.audioRms = lastRmsByLabel.mic || 0;
+  payload.audioRms = lastRmsByLabel[label] || 0;
   if (lastSpokenText) {
     payload.recentTranscript = lastSpokenText;
   }
-  if (faceConfig.enabled && lastFaceFrameB64) {
-    payload.imageB64 = lastFaceFrameB64;
-    payload.imageMimeType = 'image/jpeg';
-  }
 
   const headers = { 'Content-Type': 'application/json' };
-  if (transcribeConfig.apiKey) {
-    headers[transcribeConfig.apiKey.startsWith('Bearer ') ? 'Authorization' : 'X-API-Key'] =
-      transcribeConfig.apiKey;
-  }
 
   try {
-    const res = await fetch(transcribeConfig.endpoint, {
+    const res = await fetch(INGEST_ENDPOINT, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
@@ -420,31 +331,16 @@ async function drainTranscriptionQueue(label) {
 
     if (!res.ok) {
       const errText = await res.text();
-      setTranscribeStatus(`Transcription error: ${res.status}`, true);
       log(`Transcription error ${res.status}: ${errText}`, 'log-error');
     } else {
       const data = await res.json();
       const spoken = (data.text || '').trim();
-      appendTranscriptLine(label, data.text || '', data.isFinal ? 'final' : 'partial');
       if (spoken) updateOverlayRightPanelHeard(spoken);
       if (spoken) lastSpokenText = spoken;
       const insight = data.insight != null ? String(data.insight).trim() : '';
       if (insight) updateOverlayRightPanelInsight(insight);
-      if (data.face) {
-        const stableFeedback = computeStableFaceFeedback(data.face);
-        const now = Date.now();
-        if (stableFeedback.shouldUpdate && now - lastFeedbackUpdateTs >= FEEDBACK_UPDATE_INTERVAL_MS) {
-          lastFeedbackUpdateTs = now;
-          updateOverlayLeftFeedback(stableFeedback.text, stableFeedback.state);
-          setFaceStatus(stableFeedback.text);
-        } else if (stableFeedback.statusText) {
-          setFaceStatus(stableFeedback.statusText);
-        }
-      }
-      setTranscribeStatus('Idle');
     }
   } catch (err) {
-    setTranscribeStatus('Transcription network error', true);
     log(`Transcription network error: ${err?.message || err}`, 'log-error');
   } finally {
     transcribeInFlight[label] = false;
@@ -473,15 +369,6 @@ function emitEvent(type, payload) {
 
   return event;
 }
-
-// UI bindings
-transcribeEndpointInput.addEventListener('change', saveTranscribeConfig);
-transcribeKeyInput.addEventListener('change', saveTranscribeConfig);
-transcribeEnabledToggle.addEventListener('change', saveTranscribeConfig);
-loadTranscribeConfig();
-
-faceEnabledToggle.addEventListener('change', saveFaceConfig);
-loadFaceConfig();
 
 function normalizeCaptureError(err, step) {
   const name = err?.name || '';
@@ -618,9 +505,6 @@ async function captureTabAudioStream() {
 }
 
 function cleanupPartialCapture() {
-  recorders.forEach(r => r.state !== 'inactive' && r.stop());
-  recorders = [];
-
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
@@ -628,7 +512,7 @@ function cleanupPartialCapture() {
 
   [screenStream, tabStream, micStream, cameraStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
   screenStream = tabStream = micStream = cameraStream = null;
-  packetSeq = 0;
+  lastFaceAnalysisSentTs = 0;
 
   preview.srcObject = null;
   placeholder.style.display = '';
@@ -808,8 +692,18 @@ function resetFaceFeedbackSmoothing() {
   lastFeedbackUpdateTs = 0;
 }
 
+function applyFaceAnalysisResult(face) {
+  if (!face) return;
+  const stableFeedback = computeStableFaceFeedback(face);
+  const now = Date.now();
+  if (stableFeedback.shouldUpdate && now - lastFeedbackUpdateTs >= FEEDBACK_UPDATE_INTERVAL_MS) {
+    lastFeedbackUpdateTs = now;
+    updateOverlayLeftFeedback(stableFeedback.text, stableFeedback.state);
+  }
+}
+
 function captureAndStoreFaceFrame() {
-  if (!faceConfig.enabled || !cameraVideo) return;
+  if (!FACE_ENABLED || !cameraVideo) return;
   if (!cameraVideo.videoWidth || !cameraVideo.videoHeight) return;
 
   const srcW = cameraVideo.videoWidth;
@@ -823,20 +717,47 @@ function captureAndStoreFaceFrame() {
 
   const dataUrl = faceCanvas.toDataURL('image/jpeg', FACE_JPEG_QUALITY);
   lastFaceFrameB64 = dataUrl.split(',')[1];
-  if (!acceptedFaceFeedback && feedbackHistory.length === 0) {
-    setFaceStatus('Camera active');
+}
+
+async function analyzeLatestFaceFrame() {
+  if (!FACE_ENABLED || faceAnalysisInFlight || !lastFaceFrameB64) return;
+  const now = Date.now();
+  if (lastFaceAnalysisSentTs && now - lastFaceAnalysisSentTs < VISUAL_ANALYSIS_MS) return;
+  lastFaceAnalysisSentTs = now;
+  faceAnalysisInFlight = true;
+
+  const payload = {
+    imageB64: lastFaceFrameB64,
+    imageMimeType: 'image/jpeg',
+    audioRms: lastRmsByLabel.mic || 0,
+  };
+  if (lastSpokenText) {
+    payload.recentTranscript = lastSpokenText;
+  }
+
+  try {
+    const res = await fetch(FACE_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      log(`Face analysis error ${res.status}: ${await res.text()}`, 'log-error');
+      return;
+    }
+    const data = await res.json();
+    if (data.face) applyFaceAnalysisResult(data.face);
+  } catch (err) {
+    log(`Face analysis network error: ${err?.message || err}`, 'log-error');
+  } finally {
+    faceAnalysisInFlight = false;
   }
 }
 
 async function startFaceCapture() {
-  if (!faceConfig.enabled) return;
+  if (!FACE_ENABLED) return;
   if (cameraStream) return;
-  if (!transcribeConfig.endpoint) {
-    setFaceStatus('Missing endpoint URL', true);
-    return;
-  }
   resetFaceFeedbackSmoothing();
-  setFaceStatus('Starting camera…');
   cameraStream = await navigator.mediaDevices.getUserMedia({
     video: {
       facingMode: 'user',
@@ -851,9 +772,10 @@ async function startFaceCapture() {
   cameraVideo.playsInline = true;
   cameraVideo.srcObject = cameraStream;
   await cameraVideo.play();
-  setFaceStatus('Camera active');
   captureAndStoreFaceFrame();
-  faceInterval = setInterval(captureAndStoreFaceFrame, FACE_CAPTURE_INTERVAL_MS);
+  faceInterval = setInterval(captureAndStoreFaceFrame, VISUAL_FRAME_CAPTURE_MS);
+  analyzeLatestFaceFrame();
+  faceAnalysisInterval = setInterval(analyzeLatestFaceFrame, VISUAL_ANALYSIS_MS);
 }
 
 function stopFaceCapture() {
@@ -861,6 +783,11 @@ function stopFaceCapture() {
     clearInterval(faceInterval);
     faceInterval = null;
   }
+  if (faceAnalysisInterval) {
+    clearInterval(faceAnalysisInterval);
+    faceAnalysisInterval = null;
+  }
+  faceAnalysisInFlight = false;
   if (cameraVideo) {
     cameraVideo.srcObject = null;
     cameraVideo = null;
@@ -870,63 +797,11 @@ function stopFaceCapture() {
     cameraStream = null;
   }
   lastFaceFrameB64 = '';
+  lastFaceAnalysisSentTs = 0;
   resetFaceFeedbackSmoothing();
-  setFaceStatus('Idle');
 }
 
-// ── MediaRecorder setup ───────────────────────────────────────────────────────
-
-function attachRecorder(stream, label) {
-  let rec;
-  try {
-    rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-  } catch {
-    rec = new MediaRecorder(stream);
-  }
-
-  let resolveStopped;
-  const stopped = new Promise((resolve) => {
-    resolveStopped = resolve;
-  });
-
-  rec.ondataavailable = async (ev) => {
-    if (!ev.data || ev.data.size === 0) return;
-
-    packetSeq += 1;
-    if (!chunkStore[label]) chunkStore[label] = [];
-    chunkStore[label].push(ev.data);
-
-    const payload = {
-      packetId: packetSeq,
-      label,
-      size: ev.data.size,
-      mimeType: rec.mimeType || ev.data.type || 'unknown',
-      dataType: Object.prototype.toString.call(ev.data), // typically "[object Blob]"
-      constructorName: ev.data.constructor?.name || 'unknown',
-      isBlob: ev.data instanceof Blob,
-    };
-    emitEvent('media_chunk', payload);
-    // Transcription is handled by PCM->WAV pipeline for mic.
-    log(
-      `Packet #${payload.packetId} [${label}] ${payload.size} bytes ` +
-      `mime=${payload.mimeType} data=${payload.constructorName}`,
-      'log-audio'
-    );
-  };
-  rec.onstop = () => resolveStopped();
-  rec.start(1000);
-  recorders.push({ label, rec, stopped });
-}
-
-function finalizeRecordings() {
-  // Placeholder for future recording UI; keep stop flow safe for now.
-  Object.values(chunkStore).forEach((chunks) => {
-    if (Array.isArray(chunks)) {
-      chunks.length = 0;
-    }
-  });
-  chunkStore = {};
-
+function resetTranscriptionBuffers() {
   Object.keys(transcribeQueues).forEach((label) => {
     transcribeQueues[label].length = 0;
     transcribeInFlight[label] = false;
@@ -936,16 +811,6 @@ function finalizeRecordings() {
       transcribeTimers[label] = null;
     }
   });
-  setTranscribeStatus('Idle');
-
-  objectUrls.forEach((url) => {
-    try {
-      URL.revokeObjectURL(url);
-    } catch {
-      // no-op
-    }
-  });
-  objectUrls = [];
 }
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
@@ -985,12 +850,12 @@ async function startCapture() {
     log('Requesting microphone…', 'log-audio');
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     emitEvent('capture_start', { source: 'microphone' });
-    if (transcribeConfig.enabled) {
+    if (TRANSCRIBE_ENABLED) {
       startMicTranscription(micStream);
     }
 
-    // 2.5 Camera (optional)
-    if (faceConfig.enabled) {
+    // 2.5 Camera
+    if (FACE_ENABLED) {
       currentStep = 'camera';
       log('Requesting camera…', 'log-audio');
       await startFaceCapture();
@@ -1050,15 +915,6 @@ async function startCapture() {
     // Frame capture every 2 seconds
     frameInterval = setInterval(captureFrame, 2000);
 
-    // MediaRecorders for raw chunk logging
-    attachRecorder(tabStream,  'tab');
-    if (micStream) {
-      attachRecorder(micStream,  'mic');
-    }
-    if (sysAudioTracks.length) {
-      attachRecorder(new MediaStream(sysAudioTracks), 'system_audio');
-    }
-
     stopBtn.disabled  = false;
     log('All sources active.', 'log-audio');
   } catch (err) {
@@ -1072,16 +928,11 @@ async function startCapture() {
 
 async function stopCapture() {
   try {
-    const activeRecorders = [...recorders];
-    activeRecorders.forEach(({ rec }) => rec.state !== 'inactive' && rec.stop());
-    await Promise.allSettled(activeRecorders.map(({ stopped }) => stopped));
-    recorders = [];
-
     Object.keys(transcribeBuffers).forEach((label) => {
       flushTranscriptionBuffer(label, undefined, { force: true });
     });
 
-    finalizeRecordings();
+    resetTranscriptionBuffers();
   } catch (err) {
     console.error(err);
     log(`Stop encountered an issue: ${err?.message || err}`, 'log-error');
@@ -1103,7 +954,7 @@ async function stopCapture() {
 
     [screenStream, tabStream, micStream, cameraStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
     screenStream = tabStream = micStream = cameraStream = null;
-    packetSeq = 0;
+    lastFaceAnalysisSentTs = 0;
 
     preview.srcObject = null;
     placeholder.style.display = '';
@@ -1162,7 +1013,28 @@ function injectOverlayTextById(tabId, tabUrl, elementId, content) {
       target: { tabId },
       func: (id, next) => {
         const el = document.getElementById(id);
-        if (el) el.textContent = next;
+        if (!el) return;
+        const text = String(next || '').trim();
+        if (!text) {
+          el.textContent = '';
+          return;
+        }
+        if (text.includes('\n') || text.includes('•')) {
+          const bullets = text
+            .split(/\n+/)
+            .map((line) => line.trim().replace(/^[-•]\s*/, ''))
+            .filter(Boolean)
+            .slice(0, 3);
+          el.replaceChildren();
+          bullets.forEach((bullet) => {
+            const row = document.createElement('div');
+            row.textContent = `• ${bullet}`;
+            row.style.marginBottom = '6px';
+            el.appendChild(row);
+          });
+          return;
+        }
+        el.textContent = text;
       },
       args: [elementId, content],
     },
@@ -1172,21 +1044,20 @@ function injectOverlayTextById(tabId, tabUrl, elementId, content) {
   );
 }
 
-/** Red line at top of RHS — latest transcribed sentence (confirms audio path is live). */
-function updateOverlayRightPanelHeard(sentence) {
-  const text = String(sentence || '').trim() || 'Listening…';
-  lastOverlayHeardSentence = text;
-  runOnInsightTargetTab((tab) => {
-    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_HEARD_ID, text);
-  });
-}
-
 function updateOverlayRightPanelInsight(insightText) {
   const text = String(insightText || '').trim();
   if (!text) return;
   lastOverlayInsight = text;
   runOnInsightTargetTab((tab) => {
     injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_TEXT_ID, text);
+  });
+}
+
+function updateOverlayRightPanelHeard(sentence) {
+  const text = String(sentence || '').trim() || 'Listening…';
+  lastOverlayHeardSentence = text;
+  runOnInsightTargetTab((tab) => {
+    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_HEARD_ID, text);
   });
 }
 
@@ -1284,7 +1155,7 @@ function toggleOverlay() {
           heardInitial,
           listeningBarId
         ) => {
-          const OVERLAY_ID = 'obli-overlay-poc';
+          const OVERLAY_ID = 'obli-overlay';
           const existing = document.getElementById(OVERLAY_ID);
           if (existing) {
             existing.remove();
@@ -1370,7 +1241,34 @@ function toggleOverlay() {
             letterSpacing: '0.02em',
             textAlign: 'center',
             boxShadow: '0 6px 24px rgba(0, 0, 0, 0.35)',
+            transition: 'opacity 160ms ease, color 160ms ease, transform 160ms ease',
           };
+
+          const labelStyle = {
+            color: 'rgba(255, 255, 255, 0.72)',
+            fontFamily: 'Arial, sans-serif',
+            fontSize: '10px',
+            fontWeight: '700',
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase',
+          };
+
+          const leftColumn = document.createElement('div');
+          Object.assign(leftColumn.style, {
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'stretch',
+            justifyContent: 'center',
+            gap: '10px',
+            maxWidth: '100%',
+            width: '100%',
+            padding: '12px',
+            boxSizing: 'border-box',
+          });
+
+          const visualLabel = document.createElement('div');
+          visualLabel.textContent = 'Visual feedback';
+          Object.assign(visualLabel.style, labelStyle);
 
           const leftTextBox = document.createElement('div');
           leftTextBox.id = leftTextId;
@@ -1394,14 +1292,18 @@ function toggleOverlay() {
             width: '100%',
           });
 
+          const audioLabel = document.createElement('div');
+          audioLabel.textContent = 'Key details';
+          Object.assign(audioLabel.style, labelStyle);
+
           const heardLine = document.createElement('div');
           heardLine.id = heardTextId;
           heardLine.textContent = heardInitial;
           Object.assign(heardLine.style, {
             ...textBaseStyle,
             color: '#ff5252',
-            fontSize: 'clamp(12px, 1.15vw, 18px)',
-            fontWeight: '600',
+            fontSize: 'clamp(12px, 1.1vw, 18px)',
+            fontWeight: '700',
             letterSpacing: '0.01em',
             padding: '10px 14px',
             textAlign: 'left',
@@ -1413,22 +1315,39 @@ function toggleOverlay() {
 
           const rightTextBox = document.createElement('div');
           rightTextBox.id = rightTextId;
-          rightTextBox.textContent = overlayTextRight;
           Object.assign(rightTextBox.style, textBaseStyle, {
             maxWidth: '100%',
-            fontSize: 'clamp(13px, 1.25vw, 22px)',
-            lineHeight: '1.35',
+            fontSize: 'clamp(14px, 1.35vw, 24px)',
+            lineHeight: '1.42',
             fontWeight: '600',
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
             hyphens: 'auto',
             textAlign: 'left',
           });
+          const initialBullets = String(overlayTextRight || '')
+            .split(/\n+/)
+            .map((line) => line.trim().replace(/^[-•]\s*/, ''))
+            .filter(Boolean)
+            .slice(0, 3);
+          if (initialBullets.length) {
+            initialBullets.forEach((bullet) => {
+              const row = document.createElement('div');
+              row.textContent = `• ${bullet}`;
+              row.style.marginBottom = '6px';
+              rightTextBox.appendChild(row);
+            });
+          } else {
+            rightTextBox.textContent = overlayTextRight;
+          }
 
+          leftColumn.appendChild(visualLabel);
+          leftColumn.appendChild(leftTextBox);
+          rightColumn.appendChild(audioLabel);
           rightColumn.appendChild(heardLine);
           rightColumn.appendChild(rightTextBox);
 
-          leftPanel.appendChild(leftTextBox);
+          leftPanel.appendChild(leftColumn);
           rightPanel.appendChild(rightColumn);
           gridShell.appendChild(leftPanel);
           gridShell.appendChild(centerPanel);

@@ -98,121 +98,10 @@
         transition: width 0.1s;
       }
 
-      #log {
-        background: #111;
-        border-radius: 4px;
-        padding: 6px 8px;
-        font-size: 10px;
-        font-family: monospace;
-        height: 80px;
-        overflow-y: auto;
-        color: #7ec8a0;
-      }
-      .log-screen { color: #64b5f6; }
-      .log-audio  { color: #7ec8a0; }
-      .log-error  { color: #ef9a9a; }
-
-      #recordings {
-        margin-top: 8px;
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-      .rec-card {
-        background: #141414;
-        border: 1px solid #2b2b2b;
-        border-radius: 4px;
-        padding: 6px;
-      }
-      .rec-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        font-size: 11px;
-        margin-bottom: 6px;
-      }
-      .rec-actions {
-        display: flex;
-        gap: 6px;
-      }
-      .rec-btn {
-        flex: unset;
-        padding: 4px 6px;
-        font-size: 11px;
-        border-radius: 3px;
-        background: #2d5f98;
-        color: #fff;
-      }
-      .rec-meta {
-        font-size: 10px;
-        color: #9aa0a6;
-      }
-      .rec-empty {
-        font-size: 10px;
-        color: #777;
-      }
-
-      .section {
-        margin-top: 10px;
-        padding-top: 8px;
-        border-top: 1px solid #2a2a2a;
-      }
-      .section h4 {
-        margin: 0 0 6px;
-        font-size: 12px;
-        color: #cfcfcf;
-      }
-      .field {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        margin-bottom: 6px;
-      }
-      .field label {
-        font-size: 10px;
-        color: #9aa0a6;
-      }
-      .field input {
-        background: #101010;
-        border: 1px solid #2b2b2b;
-        border-radius: 4px;
-        padding: 6px 8px;
-        color: #e0e0e0;
-        font-size: 11px;
-      }
-      .inline {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 10px;
-        color: #9aa0a6;
-      }
-      #transcript {
-        background: #0f0f0f;
-        border: 1px solid #222;
-        border-radius: 4px;
-        padding: 6px 8px;
-        font-size: 10px;
-        color: #e0e0e0;
-        min-height: 60px;
-        max-height: 140px;
-        overflow-y: auto;
-        font-family: monospace;
-      }
-      .transcript-line {
-        margin-bottom: 4px;
-      }
-      .status {
-        font-size: 10px;
-        color: #7ec8a0;
-      }
-      .status.error {
-        color: #ef9a9a;
-      }
     </style>
   </head>
   <body>
-    <h3>Screen &amp; Audio Logger</h3>
+    <h3>Sales Meeting Notes</h3>
 
     <div id="preview-wrap">
       <video id="screen-preview" autoplay muted playsinline></video>
@@ -238,40 +127,8 @@
       <button id="start">&#9654; Start</button>
       <button id="stop" disabled>&#9632; Stop</button>
     </div>
-    <button id="overlay-toggle">Show Transparent Overlay (POC)</button>
+    <button id="overlay-toggle">Show Overlay</button>
     <button id="popout">Open Detached Window</button>
-
-    <div id="log"></div>
-    <div id="recordings">
-      <div class="rec-empty" id="recordings-empty">No recordings saved yet</div>
-    </div>
-
-    <div class="section" id="transcription">
-      <h4>Ingest Endpoint (Audio + Face)</h4>
-      <div class="field">
-        <label for="transcribe-endpoint">Endpoint URL</label>
-        <input id="transcribe-endpoint" type="text" placeholder="http://localhost:8000/ingest" />
-      </div>
-      <div class="field">
-        <label for="transcribe-key">API Key (optional)</label>
-        <input id="transcribe-key" type="password" placeholder="Bearer token or API key" />
-      </div>
-      <div class="inline">
-        <input id="transcribe-enabled" type="checkbox" checked />
-        <label for="transcribe-enabled">Enable live transcription</label>
-      </div>
-      <div class="status" id="transcribe-status">Idle</div>
-      <div id="transcript"></div>
-    </div>
-
-    <div class="section" id="face-analysis">
-      <h4>Face Analysis (Server)</h4>
-      <div class="inline">
-        <input id="face-enabled" type="checkbox" />
-        <label for="face-enabled">Enable face analysis</label>
-      </div>
-      <div class="status" id="face-status">Idle</div>
-    </div>
 
     <script src="popup.js"></script>
   </body>

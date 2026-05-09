@@ -7,8 +7,6 @@
     "tabCapture",
     "audioCapture",
     "videoCapture",
-    "downloads",
-    "storage",
     "activeTab",
     "scripting",
     "offscreen"

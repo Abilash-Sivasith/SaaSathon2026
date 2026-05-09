@@ -8,15 +8,19 @@
     "audioCapture",
     "videoCapture",
     "activeTab",
+    "tabs",
     "scripting",
-    "offscreen"
+    "offscreen",
+    "sidePanel"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_popup": "popup.html",
-    "default_title": "Screen & Audio Logger"
+    "default_title": ""
+  },
+  "side_panel": {
+    "default_path": "dist/popup.html"
   }
 }

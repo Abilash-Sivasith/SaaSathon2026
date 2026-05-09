@@ -490,6 +490,38 @@ function getTabMediaStreamId(targetTabId) {
   );
 }
 
+function getActiveCaptureTabId() {
+  return new Promise((res, rej) => {
+    chrome.runtime.sendMessage({ type: 'get_capture_target' }, (response) => {
+      if (chrome.runtime.lastError) {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+          if (chrome.runtime.lastError) {
+            rej(chrome.runtime.lastError);
+            return;
+          }
+
+          const tabId = tabs?.[0]?.id;
+          if (Number.isInteger(tabId) && tabId > 0) {
+            res(tabId);
+            return;
+          }
+
+          rej(new Error('No active browser tab found for tab audio capture.'));
+        });
+        return;
+      }
+
+      const tabId = response?.tabId;
+      if (Number.isInteger(tabId) && tabId > 0) {
+        res(tabId);
+        return;
+      }
+
+      rej(new Error(response?.error || 'No active browser tab found for tab audio capture.'));
+    });
+  });
+}
+
 async function getTabStreamById(targetTabId) {
   const streamId = await getTabMediaStreamId(targetTabId);
   return navigator.mediaDevices.getUserMedia({
@@ -504,17 +536,20 @@ async function getTabStreamById(targetTabId) {
 }
 
 async function captureTabAudioStream() {
-  // In normal popup mode, activeTab context allows direct tabCapture.capture.
-  if (!isDetachedWindow) {
-    return getTabStreamByCapture();
-  }
-
-  // In detached window mode, bind to the originating tab via stream id.
+  // Detached windows bind to the originating tab; side panels bind to the active tab.
   if (Number.isInteger(sourceTabId) && sourceTabId > 0) {
     return getTabStreamById(sourceTabId);
   }
 
-  return getTabStreamByCapture();
+  try {
+    const activeTabId = await getActiveCaptureTabId();
+    return await getTabStreamById(activeTabId);
+  } catch (err) {
+    if (isDetachedWindow) throw err;
+
+    // Keep the old toolbar-popup path as a compatibility fallback.
+    return getTabStreamByCapture();
+  }
 }
 
 function cleanupPartialCapture() {
@@ -1190,30 +1225,101 @@ function updateOverlayRightPanelHeard(sentence) {
 }
 
 function openDetachedWindow() {
-  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
-    const activeId = tabs?.[0]?.id;
-    const query = Number.isInteger(activeId) && activeId > 0
-      ? `?mode=window&sourceTabId=${activeId}`
-      : '?mode=window';
-    chrome.windows.create(
-      {
-        url: chrome.runtime.getURL(`popup.html${query}`),
-        type: 'popup',
-        width: 380,
-        height: 720,
-        focused: true,
-      },
-      () => window.close()
+  const openFallbackWindow = () => {
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+      const activeId = tabs?.[0]?.id;
+      const query = Number.isInteger(activeId) && activeId > 0
+        ? `?mode=window&sourceTabId=${activeId}`
+        : '?mode=window';
+      chrome.windows.create(
+        {
+          url: chrome.runtime.getURL(`dist/popup.html${query}`),
+          type: 'popup',
+          width: 380,
+          height: 720,
+          focused: true,
+        },
+        () => window.close()
+      );
+    });
+  };
+
+  if (chrome.sidePanel?.setOptions && chrome.sidePanel?.open) {
+    chrome.sidePanel.setOptions(
+      { path: 'dist/popup.html', enabled: true },
+      () => {
+        if (chrome.runtime.lastError) {
+          log(`Side panel setup failed: ${chrome.runtime.lastError.message}`, 'log-error');
+          openFallbackWindow();
+          return;
+        }
+        chrome.windows.getCurrent((win) => {
+          const windowId = win?.id;
+          if (!Number.isInteger(windowId)) {
+            openFallbackWindow();
+            return;
+          }
+          const maybePromise = chrome.sidePanel.open({ windowId });
+          if (maybePromise?.then) {
+            maybePromise
+              .then(() => window.close())
+              .catch((err) => {
+                log(`Side panel open failed: ${err?.message || err}`, 'log-error');
+                openFallbackWindow();
+              });
+          } else {
+            window.close();
+          }
+        });
+      }
     );
+    return;
+  }
+
+  openFallbackWindow();
+}
+
+function closeSidePanel() {
+  const sendClose = (windowId) => chrome.runtime.sendMessage({ type: 'close_side_panel', windowId }, () => {
+    window.close();
   });
+  if (chrome.windows?.getCurrent) {
+    chrome.windows.getCurrent((win) => sendClose(win?.id));
+    return;
+  }
+  sendClose();
+}
+
+function markSidePanelOpen() {
+  if (isDetachedWindow) return;
+  const sendOpen = (windowId) => chrome.runtime.sendMessage({ type: 'panel_opened', windowId }, () => {});
+  if (chrome.windows?.getCurrent) {
+    chrome.windows.getCurrent((win) => sendOpen(win?.id));
+    return;
+  }
+  sendOpen();
+}
+
+function setOverlayButtonStatus(text, restoreAfterMs = 0) {
+  if (!overlayToggleBtn) return;
+  const original = overlayToggleBtn.dataset.defaultText || overlayToggleBtn.textContent || 'Show Overlay';
+  overlayToggleBtn.dataset.defaultText = original;
+  overlayToggleBtn.textContent = text;
+  if (restoreAfterMs > 0) {
+    window.setTimeout(() => {
+      overlayToggleBtn.textContent = overlayToggleBtn.dataset.defaultText || 'Show Overlay';
+    }, restoreAfterMs);
+  }
 }
 
 function toggleOverlay() {
+  setOverlayButtonStatus('Checking tab…');
   const withTargetTab = (activeTab) => {
     const tabId = activeTab?.id;
     const capturedTabId = tabId;
     if (!Number.isInteger(tabId)) {
       log('No active tab found for overlay preview.', 'log-error');
+      setOverlayButtonStatus('No tab found', 1800);
       return;
     }
     const tabUrl = activeTab?.url || '';
@@ -1227,16 +1333,19 @@ function toggleOverlay() {
         'Overlay cannot be injected on browser internal pages. Open a normal website (for example https://example.com) and try again.',
         'log-error'
       );
+      setOverlayButtonStatus('Use website tab', 2200);
       return;
     }
+    setOverlayButtonStatus('Showing…');
 
     chrome.scripting.executeScript(
       {
         target: { tabId },
-        func: (overlayTextRight, rightTextId, heardTextId, heardInitial, lhs) => {
+        func: (overlayTextRight, rightTextId, heardTextId, heardInitial, lhs, panelInitiallyOpen) => {
           const OVERLAY_ID = 'obli-overlay';
           const existing = document.getElementById(OVERLAY_ID);
           if (existing) {
+            existing.__obliCleanup?.();
             existing.remove();
             return { state: 'removed' };
           }
@@ -1462,6 +1571,161 @@ function toggleOverlay() {
           gridShell.appendChild(centerPanel);
           gridShell.appendChild(rightPanel);
           overlay.appendChild(gridShell);
+
+          const overlayActions = document.createElement('div');
+          const overlayActionInset = 'clamp(10px, 2.5vw, 18px)';
+          Object.assign(overlayActions.style, {
+            position: 'fixed',
+            left: overlayActionInset,
+            right: overlayActionInset,
+            bottom: overlayActionInset,
+            zIndex: '2147483647',
+            pointerEvents: 'auto',
+            display: 'flex',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            justifyContent: 'flex-end',
+            gap: 'clamp(6px, 1.6vw, 8px)',
+            maxWidth: 'none',
+            boxSizing: 'border-box',
+          });
+
+          const overlayActionStyle = {
+            appearance: 'none',
+            border: '1px solid #009EC8',
+            borderRadius: '8px',
+            background: '#ffffff',
+            color: '#545454',
+            fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+            flex: '0 1 auto',
+            minWidth: '0',
+            maxWidth: '168px',
+            minHeight: 'clamp(34px, 5vw, 40px)',
+            fontSize: 'clamp(11px, 1.8vw, 12px)',
+            fontWeight: '650',
+            lineHeight: '1.1',
+            letterSpacing: '0',
+            padding: 'clamp(8px, 1.8vw, 11px) clamp(10px, 2.2vw, 15px)',
+            boxShadow: '0 1px 2px rgba(0, 51, 64, 0.08)',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            textAlign: 'center',
+            touchAction: 'manipulation',
+            transition: 'background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease, transform 100ms ease',
+          };
+
+          let panelOpen = Boolean(panelInitiallyOpen);
+          const panelButton = document.createElement('button');
+          panelButton.type = 'button';
+          panelButton.textContent = panelOpen ? 'Close Panel' : 'Open Panel';
+          Object.assign(panelButton.style, overlayActionStyle, {
+            background: '#ffffff',
+            color: '#545454',
+            border: '1px solid #009EC8',
+          });
+          const setOverlayButtonHover = (button, hovered) => {
+            button.style.background = hovered ? '#e5f8fc' : '#ffffff';
+            button.style.borderColor = '#009EC8';
+            button.style.boxShadow = hovered ? '0 2px 6px rgba(0, 158, 200, 0.16)' : '0 1px 2px rgba(0, 51, 64, 0.08)';
+          };
+          [panelButton].forEach((button) => {
+            button.addEventListener('mouseenter', () => setOverlayButtonHover(button, true));
+            button.addEventListener('mouseleave', () => setOverlayButtonHover(button, false));
+            button.addEventListener('focus', () => {
+              button.style.outline = '2px solid #009EC8';
+              button.style.outlineOffset = '2px';
+            });
+            button.addEventListener('blur', () => {
+              button.style.outline = 'none';
+            });
+            button.addEventListener('mousedown', () => {
+              button.style.transform = 'translateY(1px)';
+            });
+            button.addEventListener('mouseup', () => {
+              button.style.transform = 'translateY(0)';
+            });
+          });
+          panelButton.addEventListener('click', () => {
+            const messageType = panelOpen ? 'close_side_panel' : 'open_side_panel';
+            const fallbackText = panelOpen ? 'Close Panel' : 'Open Panel';
+            panelButton.textContent = panelOpen ? 'Closing...' : 'Opening...';
+            chrome.runtime.sendMessage({ type: messageType }, (response) => {
+              if (chrome.runtime.lastError || !response?.ok) {
+                panelButton.textContent = panelOpen ? 'Still Open' : 'Click Extension Icon';
+                window.setTimeout(() => {
+                  panelButton.textContent = fallbackText;
+                }, 1800);
+                return;
+              }
+              panelOpen = !panelOpen;
+              panelButton.textContent = panelOpen ? 'Close Panel' : 'Open Panel';
+            });
+          });
+
+          const closeOverlayButton = document.createElement('button');
+          closeOverlayButton.type = 'button';
+          closeOverlayButton.textContent = 'Close Overlay';
+          Object.assign(closeOverlayButton.style, overlayActionStyle, {
+            background: '#009EC8',
+            color: '#ffffff',
+            border: '1px solid #009EC8',
+          });
+          const setCloseOverlayHover = (hovered) => {
+            closeOverlayButton.style.background = hovered ? '#0089ad' : '#009EC8';
+            closeOverlayButton.style.borderColor = hovered ? '#0089ad' : '#009EC8';
+            closeOverlayButton.style.boxShadow = hovered ? '0 2px 6px rgba(0, 158, 200, 0.2)' : '0 1px 2px rgba(0, 51, 64, 0.08)';
+          };
+          closeOverlayButton.addEventListener('mouseenter', () => setCloseOverlayHover(true));
+          closeOverlayButton.addEventListener('mouseleave', () => setCloseOverlayHover(false));
+          closeOverlayButton.addEventListener('focus', () => {
+            closeOverlayButton.style.outline = '2px solid #009EC8';
+            closeOverlayButton.style.outlineOffset = '2px';
+          });
+          closeOverlayButton.addEventListener('blur', () => {
+            closeOverlayButton.style.outline = 'none';
+          });
+          closeOverlayButton.addEventListener('mousedown', () => {
+            closeOverlayButton.style.transform = 'translateY(1px)';
+          });
+          closeOverlayButton.addEventListener('mouseup', () => {
+            closeOverlayButton.style.transform = 'translateY(0)';
+          });
+          closeOverlayButton.addEventListener('click', () => {
+            overlay.__obliCleanup?.();
+            document.getElementById(OVERLAY_ID)?.remove();
+          });
+
+          overlayActions.appendChild(panelButton);
+          overlayActions.appendChild(closeOverlayButton);
+          overlay.appendChild(overlayActions);
+
+          const overlayButtons = [panelButton, closeOverlayButton];
+          const applyOverlayActionLayout = () => {
+            const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+            const stacked = viewportWidth < 390;
+            const compact = viewportWidth < 560;
+            Object.assign(overlayActions.style, {
+              flexDirection: stacked ? 'column' : 'row',
+              alignItems: stacked ? 'stretch' : 'center',
+              justifyContent: stacked ? 'stretch' : 'flex-end',
+            });
+            overlayButtons.forEach((button) => {
+              Object.assign(button.style, {
+                flex: stacked ? '1 1 auto' : compact ? '1 1 0' : '0 1 auto',
+                width: stacked ? '100%' : 'auto',
+                maxWidth: stacked ? '100%' : compact ? 'calc((100vw - 34px) / 2)' : '168px',
+                whiteSpace: stacked ? 'normal' : 'nowrap',
+              });
+            });
+          };
+          applyOverlayActionLayout();
+          window.addEventListener('resize', applyOverlayActionLayout, { passive: true });
+          overlay.__obliCleanup = () => {
+            window.removeEventListener('resize', applyOverlayActionLayout);
+          };
+
           document.body.appendChild(overlay);
           return { state: 'added' };
         },
@@ -1480,6 +1744,7 @@ function toggleOverlay() {
             langFill: LHS_LANGUAGE_FILL_ID,
             langCap: LHS_LANGUAGE_CAP_ID,
           },
+          Boolean(!isDetachedWindow),
         ],
       },
       (results) => {
@@ -1490,22 +1755,28 @@ function toggleOverlay() {
               `Overlay inject failed: ${msg} Enable "Allow access to file URLs" in chrome://extensions for this extension, or test on a regular website.`,
               'log-error'
             );
+            setOverlayButtonStatus('Allow file URLs', 2400);
             return;
           }
           log(
             `Overlay inject failed: ${msg} Try a regular website (https://...) instead of a restricted page.`,
             'log-error'
           );
+          setOverlayButtonStatus('Access blocked', 2200);
           return;
         }
         const state = results?.[0]?.result?.state;
         if (state === 'added') {
           overlayInsightTabId = capturedTabId;
           log('Transparent overlay preview shown on active tab.', 'log-screen');
+          setOverlayButtonStatus('Hide Overlay');
           flushPresenterLhsMeters();
         } else if (state === 'removed') {
           overlayInsightTabId = null;
           log('Transparent overlay preview removed.', 'log-screen');
+          setOverlayButtonStatus('Show Overlay');
+        } else {
+          setOverlayButtonStatus('Try again', 1600);
         }
       }
     );
@@ -1519,6 +1790,7 @@ function toggleOverlay() {
           'Could not find the original source tab. Re-open detached window from the tab you want to preview.',
           'log-error'
         );
+        setOverlayButtonStatus('Reopen panel', 2200);
         return;
       }
       withTargetTab(tab);
@@ -1526,17 +1798,41 @@ function toggleOverlay() {
     return;
   }
 
-  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
-    withTargetTab(tabs?.[0]);
+  chrome.runtime.sendMessage({ type: 'get_capture_target' }, (response) => {
+    const targetTabId = response?.tabId;
+    if (chrome.runtime.lastError || !Number.isInteger(targetTabId)) {
+      if (response?.error) log(response.error, 'log-error');
+      chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+        withTargetTab(tabs?.[0]);
+      });
+      return;
+    }
+
+    chrome.tabs.get(targetTabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+          withTargetTab(tabs?.[0]);
+        });
+        return;
+      }
+      withTargetTab(tab);
+    });
   });
 }
 
 if (isDetachedWindow && popoutBtn) {
   popoutBtn.textContent = 'Detached Window Open';
   popoutBtn.disabled = true;
+} else if (popoutBtn) {
+  popoutBtn.textContent = 'Close Panel';
+  markSidePanelOpen();
 }
 
-startBtn.addEventListener('click', startCapture);
-stopBtn.addEventListener('click', stopCapture);
-popoutBtn?.addEventListener('click', openDetachedWindow);
-overlayToggleBtn?.addEventListener('click', toggleOverlay);
+if (!startBtn || !stopBtn || !preview || !placeholder || !barTab || !barMic || !barSys) {
+  console.error('[Oblique] Popup controls did not render before popup.js loaded.');
+} else {
+  startBtn.addEventListener('click', startCapture);
+  stopBtn.addEventListener('click', stopCapture);
+  popoutBtn?.addEventListener('click', isDetachedWindow ? openDetachedWindow : closeSidePanel);
+  overlayToggleBtn?.addEventListener('click', toggleOverlay);
+}

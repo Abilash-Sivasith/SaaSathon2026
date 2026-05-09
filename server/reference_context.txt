@@ -1,45 +1,47 @@
-# Reference context for the reasoning assistant
+# MEETING CONTEXT — Justus Huneke | Oblique Demo
+# Format: topic-keyed facts. Pass transcript snippets; surface relevant block only.
 
-This file is injected into the model's prompt as domain or product guidance.
-Replace this content with your real brief: glossary, SLAs, product facts, workflows,
-constraints, tone, escalation rules, or anything that should steer how the assistant
-infers relevance from spoken transcript.
+## CONTACT
+name: Justus Huneke | age: 30 | role: Software Engineer | employer: HoldCo
+connection: friends with Rocky | colleague: John Doe (Lumin PDF team, bought $100k in 2025)
+family: 3 kids
 
-Goals for the assistant (edit as needed):
-- Keywords only — e.g. price talk → something like: $100 · max discount 20% (not prose).
-- When nothing matches: assistant prints ok (skipped in logs).
-- if the user asks about information provide that to them
+## PURCHASE HISTORY
+- Lumin PDF + Lumin Sign | 1 yr ago | spend: $20k | status: active
+- Lumin (~2010) | cancelled | reason: AWS outages → RESOLVED (now cloud-agnostic)
+- Pain point on record: cloud outage Nov 2024 → wanted refund → was resolved
 
-# In Meeting context
-- Meeting with Justus. Has bought software from us 1 year ago.
-- About Justus's previous purchases
-    - spend 20k on Lumin PDF, Lumin Sign
-    - has had a history of being happy with product, except for when there was a cloud outage in November 2024, causing him to be angry and wanting a refund.
-    - Tough negotiator, asks for large discounts (up to 50% off) but settles for 20% as long as you are strict.
-- Oblique (New product)
-    - description: A sales team trainer, and intelligence platform providing real time information and feedback for sales teams.
-    - costs $100 per month per user
-    - features include:
-        - real time information relevant for a meeting based on what is being said.
-        - real time feedback about sales techniques. 
-- Product includes PDF reading, signing, and AI Integration
-- Info about person you are talking to
-    - Justus Huneke
-    - age 30
-    - works for holdco
-    - software engineer
-    - has 3 kids
-    - Good friends with Rocky
-    - works with John Doe, who is in the Integration team and bought 100k worth of software last year for his department.
+## NEGOTIATION RULES
+- Opens at: up to 50% discount
+- Acceptable floor: 20% off (hold firm — he settles here)
+- Do NOT pre-empt with discount; wait for him to ask
 
-- Public website facts about jstEagle / Justus
-    - jstEagle likes making things, mostly web3 and websites.
-    - jstEagle is currently working on ALF Dashboard.
-    - Tools listed: TypeScript, Next.js, Cloudflare, Svelte, Python, Rust.
-    - Current stack: Next.js, TypeScript, Tailwind, Cloudflare Workers, Vercel, KV, Helius.
-    - Full Stack Engineer on AEP Life Form Project from 2024 to present.
-    - ALF work includes dashboards, on-chain data, indexing, dynamic display, efficiency and speed.
-    - Tutored math and computer science from 2023 to 2024.
+## PRODUCT — OBLIQUE
+price: $100/user/month
+pitch: real-time sales coaching + meeting intelligence platform
+features:
+  - live meeting info surfacing (context-aware)
+  - real-time sales technique feedback
+  - PDF read, sign, AI integration (familiar to Justus)
+arch: FastMCP server → LLM + Chrome extension overlay
+
+## MEETING PLAN
+1. OPEN: family / kids / life / hobbies
+2. REVIEW: Lumin experience — what's worked, any friction
+3. PITCH: Oblique — lead with live feedback angle (resonates for eng mindset)
+4. HANDLE: outage concern if raised → cloud-agnostic since 2024
+5. CLOSE: anchor at full price; concede to 20% max if pushed
+
+## SIGNAL → SURFACE RULES
+family/kids → warm opener, don't rush
+discount/price → NEGOTIATION RULES block
+outage/reliability → "cloud-agnostic since 2024" + acknowledge Nov 2024
+Lumin satisfaction → positive reinforcement, bridge to Oblique
+John Doe/Rocky → relationship leverage, social proof from 2024 to present.
+
+## BACKGROUND
+- ALF work includes dashboards, on-chain data, indexing, dynamic display, efficiency and speed.
+- Tutored math and computer science from 2023 to 2024.
 
 - Oblique demo verification scenario
     - If Justus asks why Oblique fits him, mention web3, dashboards, speed, and technical sales coaching.

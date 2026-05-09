@@ -20,6 +20,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from openai import APIStatusError, OpenAI
+import openai.resources  # noqa: F401 preload resources before asyncio.to_thread (Python 3.14 importlib race)
 from pydantic import BaseModel, Field
 
 logging.basicConfig(
@@ -178,7 +179,7 @@ def _expand_reference_query_tokens(tokens: set[str], text: str) -> set[str]:
     if any(term in lower for term in ("price", "pricing", "cost", "expensive", "per seat", "per user")):
         expanded.update({"cost", "costs", "100", "month", "user", "oblique"})
     if any(term in lower for term in ("discount", "negotiate", "negotiation", "negotiator", "refund", "outage", "november")):
-        expanded.update({"discount", "refund", "outage", "november", "2024", "negotiator", "strict", "20", "50"})
+        expanded.update({"discount", "refund", "outage", "november", "2024", "negotiator", "strict", "20", "50", "rules", "negotiation"})
     if "justus" in expanded or "huneke" in expanded:
         expanded.update({"huneke", "holdco", "kids", "software", "engineer", "rocky"})
     if any(term in lower for term in ("family", "rapport", "children", "kids")):
@@ -199,6 +200,8 @@ def _expand_reference_query_tokens(tokens: set[str], text: str) -> set[str]:
         expanded.update({"cloudflare", "workers", "typescript", "dashboard", "low-latency"})
     if "fit" in expanded or "relevant" in expanded:
         expanded.update({"web3", "dashboards", "speed", "technical", "coaching"})
+    if any(phrase in lower for phrase in ("meeting plan", "plan for the meeting", "plan for this meeting", "meeting agenda", "run the meeting")):
+        expanded.update({"open", "review", "pitch", "close", "family", "kids", "lumin", "oblique", "outage", "handle", "feedback", "hobbies"})
     return expanded
 
 
@@ -293,7 +296,7 @@ def get_reference_document() -> str:
 INSIGHT_REFERENCE_TOP_K = int(os.getenv("INSIGHT_REFERENCE_TOP_K", "8"))
 INSIGHT_REFERENCE_MAX_CHARS = int(os.getenv("INSIGHT_REFERENCE_MAX_CHARS", "2400"))
 INSIGHT_REFERENCE_MIN_SCORE = float(os.getenv("INSIGHT_REFERENCE_MIN_SCORE", "1.2"))
-INSIGHT_LLM_FALLBACK = os.getenv("INSIGHT_LLM_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
+INSIGHT_LLM_FALLBACK = os.getenv("INSIGHT_LLM_FALLBACK", "1").strip().lower() in ("1", "true", "yes")
 INSIGHT_FAST_MAX_ITEMS = int(os.getenv("INSIGHT_FAST_MAX_ITEMS", "3"))
 INSIGHT_CONTEXT_FALLBACK = os.getenv("INSIGHT_CONTEXT_FALLBACK", "1").strip().lower() not in ("0", "false", "no")
 INSIGHT_RETURN_LAST_ON_NO_MATCH = os.getenv("INSIGHT_RETURN_LAST_ON_NO_MATCH", "1").strip().lower() not in ("0", "false", "no")
@@ -354,6 +357,55 @@ def get_relevant_reference_context(latest_segment: str, transcript_context: str 
     current_project_query = any(term in latest_lower for term in ("current project", "currently working")) or (
         "project" in latest_lower and any(term in latest_lower for term in ("justus", "jsteagle", "alf"))
     )
+    negotiation_money_query = bool(
+        re.search(
+            r"\b(discount|negotiat|deal|off\b|pricing|rebate|%|percent\b|floor\b|opens\s+at)\b",
+            latest_lower,
+        )
+    )
+    meeting_plan_query = any(
+        term in latest_lower
+        for term in (
+            "meeting plan",
+            "plan for the meeting",
+            "plan for this meeting",
+            "run the meeting",
+            "meeting agenda",
+            "agenda",
+            "steps for the meeting",
+            "structured meeting",
+        )
+    )
+    opening_rapport_query = (
+        any(
+            phrase in latest_lower
+            for phrase in (
+                "open the conversation",
+                "start the conversation",
+                "how should i open",
+                "how do i open",
+                "how to open",
+                "icebreaker",
+                "break the ice",
+                "start the call",
+                "begin the meeting",
+                "warm opener",
+                "opening line",
+                "family first",
+            )
+        )
+        or (
+            bool(re.search(r"\bopen\b", latest_lower))
+            and bool(re.search(r"\b(conversation|meeting|call|rapport)\b", latest_lower))
+            and not negotiation_money_query
+        )
+    )
+    plan_or_opener_signals = meeting_plan_query or opening_rapport_query
+    if plan_or_opener_signals:
+        latest_tokens = set(latest_tokens)
+        latest_tokens.update({"family", "kids", "hobbies", "rapport", "open", "review", "pitch", "close", "lumin", "oblique"})
+        if meeting_plan_query:
+            latest_tokens.update({"experience", "outage", "cloud", "feedback", "angle"})
 
     scored: list[tuple[float, ReferenceChunk]] = []
     for chunk in REFERENCE_CHUNKS:
@@ -363,7 +415,7 @@ def get_relevant_reference_context(latest_segment: str, transcript_context: str 
         chunk_lower = chunk.text.lower()
         if title_lower.startswith("about ") and not money_query:
             continue
-        if title_lower in {"in meeting context", "meeting plan", "intro"} and not money_query:
+        if title_lower in {"in meeting context", "meeting plan", "intro"} and not money_query and not plan_or_opener_signals:
             continue
         if product_query and not explicit_person_query and not scenario_query:
             if any(term in chunk_lower for term in ("info about person", "works for holdco", "has 3 kids", "good friends", "john doe")):
@@ -423,6 +475,17 @@ def get_relevant_reference_context(latest_segment: str, transcript_context: str 
                 score += 20.0
             elif "alf work includes" in chunk_lower:
                 score += 4.0
+        if opening_rapport_query and not negotiation_money_query:
+            if title_lower.startswith("signal") or "surface rules" in chunk_lower:
+                score += 22.0
+            if title_lower.endswith("meeting plan") or (title_lower.startswith("meeting plan") and len(title_lower) <= 20):
+                score += 24.0
+            if any(term in chunk_lower for term in ("open: family", "warm opener")):
+                score += 14.0
+            if title_lower.endswith("negotiation rules") or "opens at:" in chunk_lower:
+                score -= 22.0
+        if meeting_plan_query and ("meeting plan" in title_lower or "open:" in chunk_lower):
+            score += 16.0
         # Strong exact phrases like product/person names are better than loose keyword overlap.
         for phrase in re.findall(r"\b[A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+){0,3}\b", latest_segment):
             if phrase.lower() in chunk_lower and phrase.lower() in latest_lower:
@@ -683,6 +746,31 @@ def _ranked_fact_matches_intent(fact: str, intent_text: str) -> bool:
     rocky_intent = "rocky" in lower
     family_intent = any(term in lower for term in ("family", "rapport", "kids", "children"))
     person_intent = bool(re.search(r"\b(?:justus|huneke|justice|person|who is|work|works|job|company|holdco)\b", lower)) or family_intent
+    negotiation_money_in_utterance = bool(re.search(r"\b(discount|negotiat|deal|floor|%|opens\s+at)\b", lower))
+    opening_conversation_intent = (
+        any(
+            phrase in lower
+            for phrase in (
+                "open the conversation",
+                "start the conversation",
+                "how should i open",
+                "how do i open",
+                "icebreaker",
+                "warm opener",
+            )
+        )
+        or (
+            bool(re.search(r"\bopen\b", lower))
+            and bool(re.search(r"\b(conversation|meeting|call)\b", lower))
+            and not negotiation_money_in_utterance
+        )
+    )
+
+    if opening_conversation_intent and not negotiation_money_in_utterance:
+        if re.search(r"opens\s+at|acceptable\s+floor|pre[- ]empt|negotiation\s+rules", fact_lower):
+            return False
+        if ("discount" in fact_lower or "%" in fact_lower) and re.search(r"\b50\b|\b20\b", fact_lower) and "open:" not in fact_lower and "family" not in fact_lower:
+            return False
 
     if john_intent:
         return any(term in fact_lower for term in ("$100k", "john doe", "integration team", "department software", "last year"))
@@ -734,6 +822,8 @@ def synthesize_fast_insight(reference_context: str, latest_segment: str, topic_c
         fact = _clean_reference_fact(raw_line)
         if not fact or fact.startswith("#"):
             continue
+        if re.match(r"^meeting context\b", fact, re.IGNORECASE):
+            continue
         lower_fact_raw = fact.lower()
         if lower_fact_raw in {"features include", "meeting plan", "intro", "kids, life", "ask about family"}:
             continue
@@ -770,6 +860,9 @@ def synthesize_fast_insight(reference_context: str, latest_segment: str, topic_c
         )
         refund_discount_query = any(term in intent_lower for term in ("refund", "outage", "discount", "negotiation", "negotiate", "issue", "problem", "concern"))
         sales_feedback_query = any(term in intent_lower for term in ("sales technique", "sales techniques", "meeting information", "realtime", "real time"))
+        money_query = any(term in intent_lower for term in (
+            "cost", "price", "pricing", "expensive", "spend", "spent", "100k", "20k", "worth", "purchase", "bought", "buy", "how much"
+        ))
         product_overview_query = (
             "new product" in intent_lower
             or "oblique" in intent_lower
@@ -794,14 +887,19 @@ def synthesize_fast_insight(reference_context: str, latest_segment: str, topic_c
                 continue
             if "oblique demo verification scenario" in lower_fact or lower_fact.startswith("if justus asks"):
                 continue
-            if not any(
-                term in lower_fact
-                for term in (
-                    "oblique", "sales team trainer", "intelligence platform", "real time information",
-                    "real time feedback", "costs $100", "product includes", "features include",
-                    "pdf reading", "signing", "ai integration",
+            product_lex = (
+                "oblique", "sales team trainer", "intelligence platform", "real time information",
+                "real time feedback", "costs $100", "product includes", "features include",
+                "pdf reading", "signing", "ai integration", "meeting intelligence",
+            )
+            line_looks_pricing_pitch = bool(
+                re.search(r"\b(price|pitch|features?)\s*:", lower_fact)
+                or (
+                    money_query
+                    and re.search(r"\$[\d,.]+|/\s*(?:month|user|mo)\b|\bper\s+(?:month|user)\b", lower_fact)
                 )
-            ):
+            )
+            if not any(term in lower_fact for term in product_lex) and not line_looks_pricing_pitch:
                 continue
         if profile_query and not stack_query and not alf_query:
             if not ("web3" in lower_fact and "websites" in lower_fact):
@@ -817,9 +915,6 @@ def synthesize_fast_insight(reference_context: str, latest_segment: str, topic_c
         )
         if prior_spend_query and re.search(r"\b100k\b|\$100k|john doe|department", lower_fact):
             continue
-        money_query = any(term in intent_lower for term in (
-            "cost", "price", "pricing", "expensive", "spend", "spent", "100k", "20k", "worth", "purchase", "bought", "buy", "how much"
-        ))
         feature_query = any(term in intent_lower for term in ("feature", "include", "includes", "included", "product"))
         website_query = any(term in intent_lower for term in (
             "website", "profile", "jsteagle", "stack", "tools", "alf", "dashboard", "web3"

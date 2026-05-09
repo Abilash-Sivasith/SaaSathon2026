@@ -1,0 +1,24 @@
+# Reference context for the reasoning assistant
+
+This file is injected into the model's prompt as domain or product guidance.
+Replace this content with your real brief: glossary, SLAs, product facts, workflows,
+constraints, tone, escalation rules, or anything that should steer how the assistant
+infers relevance from spoken transcript.
+
+Goals for the assistant (edit as needed):
+- Keywords only — e.g. price talk → something like: $100 · max discount 20% (not prose).
+- Only facts that fit the spoken topic now; bios/names/features stay hidden unless explicitly relevant.
+- When nothing matches: assistant prints ok (skipped in logs).
+
+# In Meeting context
+
+- New Lumin Software costs $100
+- Max discount for customers 20%
+- Product includes PDF reading, signing, and AI Integration
+- Info about person you are talking too,
+    - Justus Huneke
+    - age 30
+    - works for holdco
+    - software engineer
+    - has 3 kids
+    - Good friends with Rocky

@@ -1,4 +1,4 @@
-"""FastAPI server: receives audio from the extension, transcribes via OpenAI, logs text only here."""
+"""FastAPI server: receives audio from the extension, transcribes via OpenAI, logs each finalized transcript line and (unless disabled) an insight LLM reply built with reference_context.txt."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import asyncio
 import base64
 import logging
 import os
+import sys
+from collections import deque
 import re
 import subprocess
 import tempfile
@@ -22,15 +24,53 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
+# OpenAI's client uses httpx; keep server output focused on app + insight lines.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("transcript-server")
 
-# One line per finalized transcript: log message is exactly the text (no logger name/timestamp prefix).
+_ANSI_RED = "\033[91m"
+_ANSI_RESET = "\033[0m"
+
+
+def _transcript_log_use_red() -> bool:
+    if os.getenv("NO_COLOR", "").strip():
+        return False
+    if os.getenv("TRANSCRIPT_COLOR", "1").strip().lower() in ("0", "false", "no"):
+        return False
+    return sys.stderr.isatty()
+
+
+class _TranscriptLineFormatter(logging.Formatter):
+    """Plain message, optional bright-red ANSI for terminal transcript lines."""
+
+    def __init__(self, use_red: bool) -> None:
+        super().__init__("%(message)s")
+        self._use_red = use_red
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if self._use_red:
+            return f"{_ANSI_RED}{text}{_ANSI_RESET}"
+        return text
+
+
+# One stream per finalized chunk: logged line is exactly the reasoning model reply (no prefix).
+insight_log = logging.getLogger("insight-llm")
+insight_log.setLevel(logging.INFO)
+insight_log.propagate = False
+if not insight_log.handlers:
+    _insight_handler = logging.StreamHandler()
+    _insight_handler.setFormatter(logging.Formatter("%(message)s"))
+    insight_log.addHandler(_insight_handler)
+
+# One line per finalized transcript chunk: message is exactly the spoken text (no prefix).
 transcript_log = logging.getLogger("transcription-text")
 transcript_log.setLevel(logging.INFO)
 transcript_log.propagate = False
 if not transcript_log.handlers:
     _transcript_handler = logging.StreamHandler()
-    _transcript_handler.setFormatter(logging.Formatter("%(message)s"))
+    _transcript_handler.setFormatter(_TranscriptLineFormatter(_transcript_log_use_red()))
     transcript_log.addHandler(_transcript_handler)
 
 
@@ -57,7 +97,57 @@ _server_dir = Path(__file__).resolve().parent
 load_dotenv(_repo_root / ".env")
 load_dotenv(_server_dir / ".env")
 
+REFERENCE_MTIME: float | None = None
+REFERENCE_BODY: str = ""
+
+
+def _resolve_reference_path() -> Path:
+    raw = os.getenv("INSIGHT_REFERENCE_PATH", "").strip()
+    path = Path(raw) if raw else _server_dir / "reference_context.txt"
+    if not path.is_absolute():
+        path = _server_dir / path
+    return path
+
+
+def get_reference_document() -> str:
+    """Load reference text from disk; refresh when the file changes."""
+    global REFERENCE_MTIME, REFERENCE_BODY
+    path = _resolve_reference_path()
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        logger.warning("insight reference file missing at %s; model runs without reference", path)
+        REFERENCE_MTIME = None
+        REFERENCE_BODY = ""
+        return ""
+    if REFERENCE_MTIME != st.st_mtime:
+        REFERENCE_BODY = path.read_text(encoding="utf-8", errors="replace")
+        REFERENCE_MTIME = st.st_mtime
+    return REFERENCE_BODY
+
+
+INSIGHT_TRANSCRIPT_CONTEXT_CHARS = int(os.getenv("INSIGHT_TRANSCRIPT_CONTEXT_CHARS", "12000"))
+TRANSCRIPT_CHUNK_BUFFER: deque[str] = deque(maxlen=512)
+
+
+def append_transcript_for_insight(segment: str) -> str:
+    cleaned = segment.strip()
+    if cleaned:
+        TRANSCRIPT_CHUNK_BUFFER.append(cleaned)
+    joined = " ".join(TRANSCRIPT_CHUNK_BUFFER)
+    if len(joined) > INSIGHT_TRANSCRIPT_CONTEXT_CHARS:
+        joined = joined[-INSIGHT_TRANSCRIPT_CONTEXT_CHARS:]
+    return joined
+
+
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini-transcribe")
+
+# Optional ISO 639-1 hint (e.g. en). Unset / "auto" → model detects language (multilingual transcription).
+_tl_hint = os.getenv("OPENAI_TRANSCRIBE_LANGUAGE", "").strip().lower()
+TRANSCRIBE_LANGUAGE_HINT: str | None = None if _tl_hint in ("", "auto") else _tl_hint
+
+INSIGHT_MODEL = os.getenv("OPENAI_INSIGHT_MODEL", "gpt-4o-mini")
+INSIGHT_DISABLED = os.getenv("INSIGHT_DISABLED", "0").strip().lower() in ("1", "true", "yes")
 WEBM_TRANSCRIBE_MIN_BYTES = int(os.getenv("WEBM_TRANSCRIBE_MIN_BYTES", "32000"))
 
 STRIP_FILLER_WORDS = os.getenv("STRIP_FILLER_WORDS", "1").strip().lower() not in ("0", "false", "no")
@@ -98,10 +188,61 @@ def transcribe_then_clean(
     raw = transcribe_bytes(audio, mime_type, filename, api_key)
     return strip_filler_words(raw.strip())
 
+
+INSIGHT_REASON_SYSTEM = (
+    "You support live captions. You receive INTERNAL REFERENCE NOTES plus the transcript.\n\n"
+    "Output MUST be keywords only — not sentences, bullets, or explanations:\n"
+    "- Pull at most the few REFERENCE FACTS that match the *new finalized segment* topic (e.g. software / price "
+    "/ product → only those fields).\n"
+    "- Separate items with middot (·) or comma. Examples: \"$100 · max discount 20%\" for cost talk; "
+    "\"PDF · signing · AI\" only if they asked what the product includes.\n"
+    "- No names, rapport, bios, or extra topics unless that person/topic was clearly named in this segment.\n"
+    "- At most ONE short line of keywords (typically under ~12 words). Never outline or recap.\n"
+    "- If nothing in the reference matches this segment’s topic: output exactly: ok\n"
+    "- Plain text only; use only commas/middots between facts — no colons, headers, or parentheses."
+)
+
+
+def synthesize_insight(
+    api_key: str,
+    reference_doc: str,
+    transcript_context: str,
+    latest_segment: str,
+) -> str:
+    client = OpenAI(api_key=api_key)
+    ref = reference_doc.strip() or "(none — rely on transcript alone)"
+    user_content = (
+        "Keywords only — match facts from reference to what this segment asks or states. One line maximum.\n\n"
+        "### Reference (internal)\n"
+        + ref
+        + "\n\n### Recent transcript (context only)\n"
+        + (transcript_context.strip() or "(empty)")
+        + "\n\n### New finalized segment (match topic against reference)\n"
+        + latest_segment.strip()
+    )
+    out = client.chat.completions.create(
+        model=INSIGHT_MODEL,
+        messages=[
+            {"role": "system", "content": INSIGHT_REASON_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.15,
+        max_tokens=int(os.getenv("INSIGHT_MAX_TOKENS", "80")),
+    )
+    choice = out.choices[0].message
+    body = getattr(choice, "content", None) or ""
+    return body.strip()
+
+
+def insight_is_skip_token(text: str) -> bool:
+    t = text.strip().lower().rstrip(".!?")
+    return t in ("ok", "okay", "")
+
+
 app = FastAPI(
     title="SaaSathon2026 Transcript Server",
-    description="Transcribes audio from the extension; transcript text is logged on the server only.",
-    version="0.2.0",
+    description="Transcribes audio from the extension; logs each chunk on logger transcription-text, then insights on insight-llm using reference_context.txt.",
+    version="0.3.4",
 )
 
 app.add_middleware(
@@ -144,11 +285,16 @@ def transcribe_bytes(
     api_key: str,
 ) -> str:
     client = OpenAI(api_key=api_key)
+    _args: dict = {
+        "model": MODEL,
+        "response_format": "json",
+    }
+    if TRANSCRIBE_LANGUAGE_HINT:
+        _args["language"] = TRANSCRIBE_LANGUAGE_HINT
     if mime_type.startswith("audio/wav"):
         tr = client.audio.transcriptions.create(
-            model=MODEL,
             file=("audio.wav", audio, "audio/wav"),
-            response_format="json",
+            **_args,
         )
     else:
         if len(audio) < WEBM_TRANSCRIBE_MIN_BYTES:
@@ -179,9 +325,8 @@ def transcribe_bytes(
                 raise HTTPException(status_code=500, detail={"error": "ffmpeg_failed", "message": err})
             wav_bytes = out_path.read_bytes()
             tr = client.audio.transcriptions.create(
-                model=MODEL,
                 file=("audio.wav", wav_bytes, "audio/wav"),
-                response_format="json",
+                **_args,
             )
 
     text = getattr(tr, "text", None)
@@ -197,7 +342,11 @@ async def health() -> dict[str, str]:
 
 @app.get("/")
 async def root() -> dict[str, object]:
-    return {"ok": True, "model": MODEL}
+    return {
+        "ok": True,
+        "model": MODEL,
+        "transcribeLanguage": TRANSCRIBE_LANGUAGE_HINT or "auto",
+    }
 
 
 @app.post("/transcribe")
@@ -246,11 +395,40 @@ async def transcribe(
         ) from exc
 
     if not text:
-        return {"ok": True, "isFinal": False}
+        return {"ok": True, "isFinal": False, "text": ""}
 
     transcript_log.info("%s", text)
 
-    return {"ok": True, "isFinal": True}
+    ctx = append_transcript_for_insight(text)
+    if not INSIGHT_DISABLED:
+        try:
+            ref_text = get_reference_document()
+            insight = await asyncio.to_thread(
+                synthesize_insight,
+                api_key,
+                ref_text,
+                ctx,
+                text,
+            )
+        except APIStatusError as exc:
+            logger.warning("OpenAI insight call failed (%s): %s", exc.status_code, exc)
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "insight_openai_failed", "message": str(exc)},
+            ) from exc
+        except Exception as exc:
+            logger.exception("OpenAI insight call failed")
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "insight_failed", "message": str(exc)},
+            ) from exc
+
+        if insight and not insight_is_skip_token(insight):
+            insight_log.info("%s", insight.strip())
+        elif not insight:
+            logger.warning("insight model returned an empty reply (model=%s)", INSIGHT_MODEL)
+
+    return {"ok": True, "isFinal": True, "text": text}
 
 
 if __name__ == "__main__":

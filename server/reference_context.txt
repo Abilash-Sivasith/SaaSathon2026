@@ -13,9 +13,15 @@ Goals for the assistant (edit as needed):
 # In Meeting context
 - Meeting with Justus. Has bought software from us 1 year ago.
 - About Justus's previous purchases
-    - spend 20k 
-- New Lumin Software costs $100
-- Max discount for customers 20%
+    - spend 20k on Lumin PDF, Lumin Sign
+    - has had a history of being happy with product, except for when thier was a cloud outage in november 2024, causing him to be angry and wanting a refund. 
+    - Tought negotiator, asks for large discounts (upto 50% off) but settles for 20% as long as you are strict. 
+- Oblique (New product)
+    - description: A sales team trainer, and intelligence platform providing real time infomation, and feedback for the sales teams in real time.
+    - costs $100 per month per user
+    - features include:
+        - real time infomation relevent for a Meeting based on what is being said.
+        - real time feedback about sales techniques. 
 - Product includes PDF reading, signing, and AI Integration
 - Info about person you are talking too,
     - Justus Huneke

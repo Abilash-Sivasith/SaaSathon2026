@@ -25,6 +25,22 @@ features:
   - PDF read, sign, AI integration (familiar to Justus)
 arch: FastMCP server → LLM + Chrome extension overlay
 
+## HARD ANSWERS — NEW PRODUCT QUESTION
+triggers: new product, brand new product, do you have a new product, any new product from the company, new offering, launching something new, what are you selling now, is there something new, company's new tool, brand new platform
+answer: Yes — the new product is Oblique. Oblique is real-time sales coaching plus meeting intelligence: it surfaces context-aware live meeting info, gives real-time technique feedback while you talk, and ties in PDF read / sign / AI workflows. Architecture: FastMCP server with an LLM-backed pipeline and a Chrome extension overlay for live cues.
+keywords for overlay: Oblique | new product | live coaching | meeting intelligence | overlay
+
+## HARD ANSWERS — PRICING QUESTION
+triggers: pricing, price, cost, how much, subscription, per seat, per user, invoice, budget, discount, deal, cheaper, negotiate, reduce the price
+fixed price: $100 per user per month (state as $100/user/month in cues)
+discount strategy: Do not lead with a discount — wait until the prospect asks or pushes on price. Opens with room to go up to ~50% off if needed for the conversation, but treat ~20% off as the realistic floor and hold firm there once offered.
+keywords for overlay: $100/month/user | 20% discount floor | 50% max opener | wait for discount ask
+
+## HARD ANSWERS — 2014 PRIOR EXPERIENCE AND AWS
+triggers: 2014, back in 2014, back then, years ago, previous experience, old relationship, how we knew each other before, history with you, former customer, used to be a customer, walked away, left you, why we left, AWS, Amazon Web Services, outage, cloud reliability, cloud problems
+answer: They were previous customers in that earlier era; the relationship strained and they ultimately left largely because of operational and reliability pain tied to cloud/hosting on AWS (legacy stack and incident risk). Today you are cloud-agnostic — multi-vendor-capable, not locked to a single hyperscaler — specifically to avoid a repeat of that single-cloud dependence and to keep workloads portable and resilient.
+keywords for overlay: previous customers | AWS pain | left over cloud | cloud-agnostic now | portable reliable stack
+
 ## MEETING PLAN
 1. OPEN: family / kids / life / hobbies
 2. REVIEW: Lumin experience — what's worked, any friction
@@ -34,8 +50,11 @@ arch: FastMCP server → LLM + Chrome extension overlay
 
 ## SIGNAL → SURFACE RULES
 family/kids → warm opener, don't rush
-discount/price → NEGOTIATION RULES block
-outage/reliability → "cloud-agnostic since 2024" + acknowledge Nov 2024
+new product / new offering / launching anything → HARD ANSWERS — NEW PRODUCT QUESTION
+discount/price / how much / pricing → HARD ANSWERS — PRICING QUESTION (also NEGOTIATION RULES)
+2014 / prior experience / former customer / AWS / why we left → HARD ANSWERS — 2014 PRIOR EXPERIENCE AND AWS
+other discount talk → NEGOTIATION RULES block
+outage/reliability → "cloud-agnostic since 2024" + acknowledge Nov 2024 + cloud-agnostic positioning
 Lumin satisfaction → positive reinforcement, bridge to Oblique
 John Doe/Rocky → relationship leverage, social proof from 2024 to present.
 

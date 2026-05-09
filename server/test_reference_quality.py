@@ -539,7 +539,14 @@ COACH_CASES = [
         "text": "That was a bad damn answer.",
         "audio_rms": 0.01,
         "expected_state": "warning",
-        "expected": ["Tone down"],
+        "expected": ["Calm down", "watch your language"],
+    },
+    {
+        "name": "offensive_and_volume",
+        "text": "That price is damn ridiculous.",
+        "audio_rms": main.COACH_RAISED_VOICE_RMS + 0.02,
+        "expected_state": "warning",
+        "expected": ["Calm down", "watch your language", "volume"],
     },
     {
         "name": "raised_voice_warning",

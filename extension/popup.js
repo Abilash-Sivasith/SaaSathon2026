@@ -63,18 +63,26 @@ let micPcmBuffer = [];
 let micPcmSampleRate = 48000;
 
 /** Latest insight keywords from the server; shown in the on-page overlay right panel. */
-let lastOverlayInsight =
-  'Key details appear here.';
+let lastOverlayInsight = '';
 const OVERLAY_RIGHT_TEXT_ID = 'obli-overlay-right-text';
 const OVERLAY_RIGHT_HEARD_ID = 'obli-overlay-right-heard';
-const OVERLAY_LEFT_FEEDBACK_ID = 'obli-overlay-left-feedback';
-const OVERLAY_LISTENING_BAR_ID = 'obli-overlay-listening-bar';
+/** Presenter LHS meters (semantic / tempo / expression / wording) — same IDs as presenter-overlay.js. */
+const LHS_SEMANTIC_FILL_ID = 'obli-overlay-lhs-semantic-fill';
+const LHS_SEMANTIC_CAP_ID = 'obli-overlay-lhs-semantic-cap';
+const LHS_TEMPO_FILL_ID = 'obli-overlay-lhs-tempo-fill';
+const LHS_TEMPO_CAP_ID = 'obli-overlay-lhs-tempo-cap';
+const LHS_EXPRESSION_FILL_ID = 'obli-overlay-lhs-expression-fill';
+const LHS_EXPRESSION_CAP_ID = 'obli-overlay-lhs-expression-cap';
+const LHS_LANGUAGE_FILL_ID = 'obli-overlay-lhs-language-fill';
+const LHS_LANGUAGE_CAP_ID = 'obli-overlay-lhs-language-cap';
 /** Tab id where the overlay was last shown; fixes tab resolution from the extension popup. */
 let overlayInsightTabId = null;
 /** Last finalized transcript shown in red so the user can confirm what was heard. */
 let lastOverlayHeardSentence = 'Listening…';
-let lastOverlayFeedbackText = 'Coach: camera idle. Start when ready.';
-let lastOverlayFeedbackState = 'neutral';
+/** Last ingest `delivery` object from the server (semantic / tempo / language bars). */
+let lastDeliverySnapshot = null;
+/** Facial expression meter (LHS), updated from `/face`; wording bar comes from ingest. */
+let lastFacialLhs = { score: 68, label: 'Awaiting expression signal…' };
 let lastSpokenText = '';
 let lastFeedbackUpdateTs = 0;
 const feedbackHistory = [];
@@ -339,6 +347,10 @@ async function drainTranscriptionQueue(label) {
       if (spoken) lastSpokenText = spoken;
       const insight = data.insight != null ? String(data.insight).trim() : '';
       if (insight) updateOverlayRightPanelInsight(insight);
+      if (data.delivery) {
+        lastDeliverySnapshot = data.delivery;
+        flushPresenterLhsMeters();
+      }
       if (data.coach) applySpeechCoachingResult(data.coach);
     }
   } catch (err) {
@@ -519,6 +531,13 @@ function cleanupPartialCapture() {
   placeholder.style.display = '';
   barTab.style.width = barMic.style.width = barSys.style.width = '0%';
 
+  lastDeliverySnapshot = null;
+  lastOverlayInsight = '';
+  flushPresenterLhsMeters();
+  runOnInsightTargetTab((tab) => {
+    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_TEXT_ID, '');
+  });
+
   startBtn.disabled = false;
   stopBtn.disabled  = true;
 }
@@ -604,7 +623,7 @@ function formatFaceFeedback(state, reason, feedbackText, confidence = 0.5) {
     return {
       state: 'warning',
       confidence: normalizedConfidence,
-      text: 'Tone down.',
+      text: 'Calm down — watch your language.',
     };
   }
   if (normalized === 'bored') {
@@ -687,8 +706,8 @@ function computeStableFaceFeedback(face) {
   }
 
   return {
-    state: acceptedFaceFeedback?.state || lastOverlayFeedbackState || 'neutral',
-    text: acceptedFaceFeedback?.text || lastOverlayFeedbackText,
+    state: acceptedFaceFeedback?.state || 'neutral',
+    text: acceptedFaceFeedback?.text || lastFacialLhs.label,
     shouldUpdate: false,
     statusText: 'Watching for a stable face signal…',
   };
@@ -698,28 +717,35 @@ function resetFaceFeedbackSmoothing() {
   feedbackHistory.length = 0;
   acceptedFaceFeedback = null;
   lastFeedbackUpdateTs = 0;
+  lastFacialLhs = { score: 68, label: 'Awaiting expression signal…' };
 }
 
 function applyFaceAnalysisResult(face) {
   if (!face) return;
   if (normalizeFaceState(face.state) === 'warning') {
-    applySpeechCoachingResult(face);
+    applySpeechCoachingResult(face, { syncFacial: true });
     return;
   }
   const stableFeedback = computeStableFaceFeedback(face);
   const now = Date.now();
   if (stableFeedback.shouldUpdate && now - lastFeedbackUpdateTs >= FEEDBACK_UPDATE_INTERVAL_MS) {
     lastFeedbackUpdateTs = now;
-    updateOverlayLeftFeedback(stableFeedback.text, stableFeedback.state);
+    const st = normalizeFaceState(stableFeedback.state);
+    const scoreMap = { engaged: 91, neutral: 72, bored: 43, warning: 24 };
+    lastFacialLhs = {
+      score: scoreMap[st] ?? 66,
+      label: stableFeedback.text || 'Stay present.',
+    };
+    flushPresenterLhsMeters();
   }
 }
 
-function applySpeechCoachingResult(coach) {
+function applySpeechCoachingResult(coach, options = {}) {
   if (!coach) return;
   const feedback = formatFaceFeedback(
     coach.state || 'warning',
     coach.reason || '',
-    coach.feedback || 'Tone down.',
+    coach.feedback || 'Calm down — watch your language.',
     coach.confidence ?? 0.95
   );
   acceptedFaceFeedback = {
@@ -730,7 +756,10 @@ function applySpeechCoachingResult(coach) {
   feedbackHistory.push(acceptedFaceFeedback);
   if (feedbackHistory.length > FEEDBACK_HISTORY_SIZE) feedbackHistory.shift();
   lastFeedbackUpdateTs = Date.now();
-  updateOverlayLeftFeedback(feedback.text, 'warning');
+  if (options.syncFacial) {
+    lastFacialLhs = { score: 22, label: feedback.text };
+  }
+  flushPresenterLhsMeters();
 }
 
 function captureAndStoreFaceFrame() {
@@ -1029,6 +1058,74 @@ function runOnInsightTargetTab(callback) {
   runOnActiveWebTab(callback);
 }
 
+function flushPresenterLhsMeters() {
+  const semantic = lastDeliverySnapshot?.semantic;
+  const tempoRaw = lastDeliverySnapshot?.tempo;
+  const language = lastDeliverySnapshot?.language;
+  const facial = lastFacialLhs;
+  let tempo = tempoRaw;
+  if (tempoRaw && tempoRaw.wpm != null && tempoRaw.wpm !== '') {
+    tempo = {
+      ...tempoRaw,
+      label: `${tempoRaw.label} (${tempoRaw.wpm} wpm)`,
+    };
+  }
+  const payload = {
+    semantic: semantic || { score: 52, label: 'Semantics — speak to score clarity' },
+    tempo: tempo || { score: 52, label: 'Tempo — scored from words vs clip length' },
+    language: language || { score: 86, label: 'Words — calm, professional language' },
+    facial,
+  };
+  runOnInsightTargetTab((tab) => {
+    const tabId = tab?.id;
+    const tabUrl = tab?.url || '';
+    if (!Number.isInteger(tabId)) return;
+    if (
+      tabUrl.startsWith('chrome://') ||
+      tabUrl.startsWith('chrome-extension://') ||
+      tabUrl.startsWith('edge://') ||
+      tabUrl.startsWith('about:')
+    ) {
+      return;
+    }
+    const ids = {
+      semFill: LHS_SEMANTIC_FILL_ID,
+      semCap: LHS_SEMANTIC_CAP_ID,
+      tempoFill: LHS_TEMPO_FILL_ID,
+      tempoCap: LHS_TEMPO_CAP_ID,
+      langFill: LHS_LANGUAGE_FILL_ID,
+      langCap: LHS_LANGUAGE_CAP_ID,
+      faceFill: LHS_EXPRESSION_FILL_ID,
+      faceCap: LHS_EXPRESSION_CAP_ID,
+    };
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        func: (pack, idMap) => {
+          const paint = (fillId, capId, row) => {
+            const pct = Math.max(0, Math.min(100, Number(row?.score) || 0));
+            const fill = document.getElementById(fillId);
+            const cap = document.getElementById(capId);
+            if (fill) {
+              fill.style.width = `${pct}%`;
+              fill.style.background = pct >= 68 ? '#2e7d32' : pct >= 42 ? '#ef6c00' : '#c62828';
+            }
+            if (cap) cap.textContent = String(row?.label || '').trim();
+          };
+          paint(idMap.semFill, idMap.semCap, pack.semantic);
+          paint(idMap.tempoFill, idMap.tempoCap, pack.tempo);
+          paint(idMap.langFill, idMap.langCap, pack.language);
+          paint(idMap.faceFill, idMap.faceCap, pack.facial);
+        },
+        args: [payload, ids],
+      },
+      () => {
+        void chrome.runtime.lastError;
+      }
+    );
+  });
+}
+
 function injectOverlayTextById(tabId, tabUrl, elementId, content) {
   if (!Number.isInteger(tabId)) return;
   if (
@@ -1092,47 +1189,6 @@ function updateOverlayRightPanelHeard(sentence) {
   });
 }
 
-function updateOverlayLeftFeedback(feedbackText, feedbackState) {
-  const text = String(feedbackText || '').trim();
-  if (!text) return;
-  lastOverlayFeedbackText = text;
-  if (feedbackState) lastOverlayFeedbackState = feedbackState;
-  runOnInsightTargetTab((tab) => {
-    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_LEFT_FEEDBACK_ID, text);
-    setOverlayLeftFeedbackColor(tab?.id, tab?.url || '', lastOverlayFeedbackState);
-  });
-}
-
-function setOverlayLeftFeedbackColor(tabId, tabUrl, state) {
-  if (!Number.isInteger(tabId)) return;
-  if (
-    tabUrl.startsWith('chrome://') ||
-    tabUrl.startsWith('chrome-extension://') ||
-    tabUrl.startsWith('edge://') ||
-    tabUrl.startsWith('about:')
-  ) {
-    return;
-  }
-  const color = state === 'engaged'
-    ? '#5fe075'
-    : state === 'bored' || state === 'warning'
-      ? '#ff6b6b'
-      : '#ffd54f';
-  chrome.scripting.executeScript(
-    {
-      target: { tabId },
-      func: (id, nextColor) => {
-        const el = document.getElementById(id);
-        if (el) el.style.color = nextColor;
-      },
-      args: [OVERLAY_LEFT_FEEDBACK_ID, color],
-    },
-    () => {
-      void chrome.runtime.lastError;
-    }
-  );
-}
-
 function openDetachedWindow() {
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
     const activeId = tabs?.[0]?.id;
@@ -1177,15 +1233,7 @@ function toggleOverlay() {
     chrome.scripting.executeScript(
       {
         target: { tabId },
-        func: (
-          overlayTextLeft,
-          overlayTextRight,
-          leftTextId,
-          rightTextId,
-          heardTextId,
-          heardInitial,
-          listeningBarId
-        ) => {
+        func: (overlayTextRight, rightTextId, heardTextId, heardInitial, lhs) => {
           const OVERLAY_ID = 'obli-overlay';
           const existing = document.getElementById(OVERLAY_ID);
           if (existing) {
@@ -1204,30 +1252,11 @@ function toggleOverlay() {
             pointerEvents: 'none',
           });
 
-          const listeningBar = document.createElement('div');
-          listeningBar.id = listeningBarId;
-          listeningBar.textContent = 'Listening';
-          Object.assign(listeningBar.style, {
-            flex: '0 0 auto',
-            width: '100%',
-            padding: '8px 16px',
-            boxSizing: 'border-box',
-            background: 'rgba(0, 0, 0, 0.72)',
-            color: 'rgba(255, 255, 255, 0.95)',
-            fontFamily: 'Arial, sans-serif',
-            fontSize: '11px',
-            fontWeight: '700',
-            letterSpacing: '0.22em',
-            textTransform: 'uppercase',
-            textAlign: 'center',
-            borderBottom: '1px solid rgba(255, 255, 255, 0.12)',
-            boxShadow: '0 4px 16px rgba(0, 0, 0, 0.35)',
-          });
-
           const gridShell = document.createElement('div');
           Object.assign(gridShell.style, {
             flex: '1',
             minHeight: '0',
+            height: '100%',
             display: 'grid',
             gridTemplateColumns: '20vw 1fr 20vw',
           });
@@ -1297,20 +1326,74 @@ function toggleOverlay() {
             boxSizing: 'border-box',
           });
 
-          const visualLabel = document.createElement('div');
-          visualLabel.textContent = 'Visual feedback';
-          Object.assign(visualLabel.style, labelStyle);
+          const lhsHeading = document.createElement('div');
+          lhsHeading.textContent = 'Live delivery cues';
+          Object.assign(lhsHeading.style, labelStyle);
 
-          const leftTextBox = document.createElement('div');
-          leftTextBox.id = leftTextId;
-          leftTextBox.textContent = overlayTextLeft;
-          Object.assign(leftTextBox.style, textBaseStyle, {
-            fontSize: 'clamp(13px, 1.25vw, 22px)',
-            lineHeight: '1.35',
-            textAlign: 'left',
+          const capStyle = {
+            fontFamily: 'Arial, sans-serif',
+            fontSize: 'clamp(10px, 0.9vw, 13px)',
+            color: 'rgba(255, 255, 255, 0.9)',
+            lineHeight: '1.38',
+            fontWeight: '600',
+            marginTop: '5px',
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
+          };
+
+          const makeBarBlock = (titleText, fillId, capId) => {
+            const wrap = document.createElement('div');
+            const titleEl = document.createElement('div');
+            titleEl.textContent = titleText;
+            Object.assign(titleEl.style, labelStyle);
+
+            const track = document.createElement('div');
+            Object.assign(track.style, {
+              height: '9px',
+              borderRadius: '6px',
+              background: 'rgba(255, 255, 255, 0.07)',
+              overflow: 'hidden',
+              border: '1px solid rgba(255, 255, 255, 0.14)',
+              marginTop: '4px',
+            });
+            const fill = document.createElement('div');
+            fill.id = fillId;
+            Object.assign(fill.style, {
+              height: '100%',
+              width: '45%',
+              borderRadius: '4px',
+              transition: 'width 220ms ease, background 180ms ease',
+              background: '#ef6c00',
+            });
+
+            track.appendChild(fill);
+
+            const cap = document.createElement('div');
+            cap.id = capId;
+            Object.assign(cap.style, capStyle);
+
+            wrap.appendChild(titleEl);
+            wrap.appendChild(track);
+            wrap.appendChild(cap);
+            return wrap;
+          };
+
+          const semBlock = makeBarBlock('Semantics', lhs.semFill, lhs.semCap);
+          const tempoBlock = makeBarBlock('Tempo', lhs.tempoFill, lhs.tempoCap);
+          const exprBlock = makeBarBlock('Expression', lhs.faceFill, lhs.faceCap);
+          const wordingBlock = makeBarBlock('Wording', lhs.langFill, lhs.langCap);
+
+          const lhsCard = document.createElement('div');
+          Object.assign(lhsCard.style, {
+            ...textBaseStyle,
+            padding: '12px 14px',
+            textAlign: 'left',
           });
+          lhsCard.appendChild(lhsHeading);
+          lhsCard.appendChild(semBlock);
+          lhsCard.appendChild(tempoBlock);
+          lhsCard.appendChild(exprBlock);
+          lhsCard.appendChild(wordingBlock);
 
           const rightColumn = document.createElement('div');
           Object.assign(rightColumn.style, {
@@ -1322,10 +1405,6 @@ function toggleOverlay() {
             maxWidth: '100%',
             width: '100%',
           });
-
-          const audioLabel = document.createElement('div');
-          audioLabel.textContent = 'Key details';
-          Object.assign(audioLabel.style, labelStyle);
 
           const heardLine = document.createElement('div');
           heardLine.id = heardTextId;
@@ -1369,12 +1448,11 @@ function toggleOverlay() {
               rightTextBox.appendChild(row);
             });
           } else {
-            rightTextBox.textContent = overlayTextRight;
+            rightTextBox.textContent = overlayTextRight ? String(overlayTextRight).trim() : '';
           }
 
-          leftColumn.appendChild(visualLabel);
-          leftColumn.appendChild(leftTextBox);
-          rightColumn.appendChild(audioLabel);
+          leftColumn.appendChild(lhsCard);
+
           rightColumn.appendChild(heardLine);
           rightColumn.appendChild(rightTextBox);
 
@@ -1383,19 +1461,25 @@ function toggleOverlay() {
           gridShell.appendChild(leftPanel);
           gridShell.appendChild(centerPanel);
           gridShell.appendChild(rightPanel);
-          overlay.appendChild(listeningBar);
           overlay.appendChild(gridShell);
           document.body.appendChild(overlay);
           return { state: 'added' };
         },
         args: [
-          lastOverlayFeedbackText,
           lastOverlayInsight,
-          OVERLAY_LEFT_FEEDBACK_ID,
           OVERLAY_RIGHT_TEXT_ID,
           OVERLAY_RIGHT_HEARD_ID,
           lastOverlayHeardSentence,
-          OVERLAY_LISTENING_BAR_ID,
+          {
+            semFill: LHS_SEMANTIC_FILL_ID,
+            semCap: LHS_SEMANTIC_CAP_ID,
+            tempoFill: LHS_TEMPO_FILL_ID,
+            tempoCap: LHS_TEMPO_CAP_ID,
+            faceFill: LHS_EXPRESSION_FILL_ID,
+            faceCap: LHS_EXPRESSION_CAP_ID,
+            langFill: LHS_LANGUAGE_FILL_ID,
+            langCap: LHS_LANGUAGE_CAP_ID,
+          },
         ],
       },
       (results) => {
@@ -1418,7 +1502,7 @@ function toggleOverlay() {
         if (state === 'added') {
           overlayInsightTabId = capturedTabId;
           log('Transparent overlay preview shown on active tab.', 'log-screen');
-          setOverlayLeftFeedbackColor(tabId, tabUrl, lastOverlayFeedbackState);
+          flushPresenterLhsMeters();
         } else if (state === 'removed') {
           overlayInsightTabId = null;
           log('Transparent overlay preview removed.', 'log-screen');

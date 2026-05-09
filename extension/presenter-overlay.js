@@ -1,14 +1,18 @@
 /**
- * Presenter overlay — present by default on normal pages.
- * Element IDs must stay in sync with extension/popup.js (text + color updates).
+ * Presenter overlay — optional content script parity with extension/popup.js `toggleOverlay`.
+ * Element IDs MUST match popup.js LHS meter IDs so `flushPresenterLhsMeters` can repaint bars.
  */
-const OB_OVERLAY_ID = 'obli-overlay-poc';
-const OB_LEFT_TEXT_ID = 'obli-overlay-left-feedback';
-const OB_LEFT_DELIVERY_ID = 'obli-overlay-left-delivery';
-const OB_LEFT_BRIEF_ID = 'obli-overlay-left-brief';
+const OB_OVERLAY_ID = 'obli-overlay';
+const OB_LHS_SEMANTIC_FILL_ID = 'obli-overlay-lhs-semantic-fill';
+const OB_LHS_SEMANTIC_CAP_ID = 'obli-overlay-lhs-semantic-cap';
+const OB_LHS_TEMPO_FILL_ID = 'obli-overlay-lhs-tempo-fill';
+const OB_LHS_TEMPO_CAP_ID = 'obli-overlay-lhs-tempo-cap';
+const OB_LHS_EXPRESSION_FILL_ID = 'obli-overlay-lhs-expression-fill';
+const OB_LHS_EXPRESSION_CAP_ID = 'obli-overlay-lhs-expression-cap';
+const OB_LHS_LANGUAGE_FILL_ID = 'obli-overlay-lhs-language-fill';
+const OB_LHS_LANGUAGE_CAP_ID = 'obli-overlay-lhs-language-cap';
 const OB_RIGHT_TEXT_ID = 'obli-overlay-right-text';
 const OB_HEARD_TEXT_ID = 'obli-overlay-right-heard';
-const OB_LISTENING_BAR_ID = 'obli-overlay-listening-bar';
 
 function obliCanInjectOverlay() {
   const proto = location.protocol;
@@ -16,12 +20,7 @@ function obliCanInjectOverlay() {
 }
 
 function obliBuildPresenterOverlay() {
-  const overlayTextLeft = 'Coach: camera idle. Start when ready.';
-  const overlayTextRight =
-    'Key details appear once speech is transcribed and the server matches your brief.';
-  const overlayBriefInitial = overlayTextRight;
-  const overlayDeliveryInitial =
-    'Tone: —\nPace: — (smoothed wpm / instant wpm / sec per word / clip length appear after you speak.)';
+  const overlayTextRight = '';
   const heardInitial = 'Listening…';
 
   const overlay = document.createElement('div');
@@ -35,30 +34,11 @@ function obliBuildPresenterOverlay() {
     pointerEvents: 'none',
   });
 
-  const listeningBar = document.createElement('div');
-  listeningBar.id = OB_LISTENING_BAR_ID;
-  listeningBar.textContent = 'Listening';
-  Object.assign(listeningBar.style, {
-    flex: '0 0 auto',
-    width: '100%',
-    padding: '8px 16px',
-    boxSizing: 'border-box',
-    background: 'rgba(0, 0, 0, 0.72)',
-    color: 'rgba(255, 255, 255, 0.95)',
-    fontFamily: 'Arial, sans-serif',
-    fontSize: '11px',
-    fontWeight: '700',
-    letterSpacing: '0.22em',
-    textTransform: 'uppercase',
-    textAlign: 'center',
-    borderBottom: '1px solid rgba(255, 255, 255, 0.12)',
-    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.35)',
-  });
-
   const gridShell = document.createElement('div');
   Object.assign(gridShell.style, {
     flex: '1',
     minHeight: '0',
+    height: '100%',
     display: 'grid',
     gridTemplateColumns: '20vw 1fr 20vw',
   });
@@ -127,55 +107,93 @@ function obliBuildPresenterOverlay() {
     boxSizing: 'border-box',
   });
 
-  const visualLabel = document.createElement('div');
-  visualLabel.textContent = 'Visual feedback';
-  Object.assign(visualLabel.style, labelStyle);
+  const lhsHeading = document.createElement('div');
+  lhsHeading.textContent = 'Live delivery cues';
+  Object.assign(lhsHeading.style, labelStyle);
 
-  const leftTextBox = document.createElement('div');
-  leftTextBox.id = OB_LEFT_TEXT_ID;
-  leftTextBox.textContent = overlayTextLeft;
-  Object.assign(leftTextBox.style, textBaseStyle, {
-    fontSize: 'clamp(13px, 1.25vw, 22px)',
-    lineHeight: '1.35',
-    textAlign: 'left',
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-    color: '#ffd54f',
-  });
-
-  const toneTempoLabel = document.createElement('div');
-  toneTempoLabel.textContent = 'Tone & tempo';
-  Object.assign(toneTempoLabel.style, labelStyle);
-
-  const leftDeliveryBox = document.createElement('div');
-  leftDeliveryBox.id = OB_LEFT_DELIVERY_ID;
-  leftDeliveryBox.textContent = overlayDeliveryInitial;
-  Object.assign(leftDeliveryBox.style, textBaseStyle, {
-    fontSize: 'clamp(11px, 1.05vw, 16px)',
-    lineHeight: '1.4',
-    textAlign: 'left',
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-    color: '#c8e6c9',
+  const capStyle = {
+    fontFamily: 'Arial, sans-serif',
+    fontSize: 'clamp(10px, 0.9vw, 13px)',
+    color: 'rgba(255, 255, 255, 0.9)',
+    lineHeight: '1.38',
     fontWeight: '600',
-  });
-
-  const briefLabel = document.createElement('div');
-  briefLabel.textContent = 'Context matches';
-  Object.assign(briefLabel.style, labelStyle);
-
-  const leftBriefBox = document.createElement('div');
-  leftBriefBox.id = OB_LEFT_BRIEF_ID;
-  leftBriefBox.textContent = overlayBriefInitial;
-  Object.assign(leftBriefBox.style, textBaseStyle, {
-    fontSize: 'clamp(11px, 1.07vw, 17px)',
-    lineHeight: '1.42',
-    textAlign: 'left',
+    marginTop: '5px',
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-word',
-    color: '#b3e5fc',
-    fontWeight: '600',
+  };
+
+  const makeBarBlock = (titleText, fillId, capId, captionText) => {
+    const wrap = document.createElement('div');
+    const titleEl = document.createElement('div');
+    titleEl.textContent = titleText;
+    Object.assign(titleEl.style, labelStyle);
+
+    const track = document.createElement('div');
+    Object.assign(track.style, {
+      height: '9px',
+      borderRadius: '6px',
+      background: 'rgba(255, 255, 255, 0.07)',
+      overflow: 'hidden',
+      border: '1px solid rgba(255, 255, 255, 0.14)',
+      marginTop: '4px',
+    });
+    const fill = document.createElement('div');
+    fill.id = fillId;
+    Object.assign(fill.style, {
+      height: '100%',
+      width: '45%',
+      borderRadius: '4px',
+      transition: 'width 220ms ease, background 180ms ease',
+      background: '#ef6c00',
+    });
+
+    track.appendChild(fill);
+
+    const cap = document.createElement('div');
+    cap.id = capId;
+    Object.assign(cap.style, capStyle);
+    cap.textContent = captionText;
+
+    wrap.appendChild(titleEl);
+    wrap.appendChild(track);
+    wrap.appendChild(cap);
+    return wrap;
+  };
+
+  const lhsCard = document.createElement('div');
+  Object.assign(lhsCard.style, {
+    ...textBaseStyle,
+    padding: '12px 14px',
+    textAlign: 'left',
   });
+  lhsCard.appendChild(lhsHeading);
+  lhsCard.appendChild(
+    makeBarBlock('Semantics', OB_LHS_SEMANTIC_FILL_ID, OB_LHS_SEMANTIC_CAP_ID, 'Speak to analyze clarity.')
+  );
+  lhsCard.appendChild(
+    makeBarBlock(
+      'Tempo',
+      OB_LHS_TEMPO_FILL_ID,
+      OB_LHS_TEMPO_CAP_ID,
+      'Comfortable pacing scores green; rushed or sluggish trends red.'
+    )
+  );
+  lhsCard.appendChild(
+    makeBarBlock(
+      'Expression',
+      OB_LHS_EXPRESSION_FILL_ID,
+      OB_LHS_EXPRESSION_CAP_ID,
+      'Camera on — facial engagement updates live.'
+    )
+  );
+  lhsCard.appendChild(
+    makeBarBlock(
+      'Wording',
+      OB_LHS_LANGUAGE_FILL_ID,
+      OB_LHS_LANGUAGE_CAP_ID,
+      'Professional language scores high; flagged words dip the bar.'
+    )
+  );
 
   const rightColumn = document.createElement('div');
   Object.assign(rightColumn.style, {
@@ -207,7 +225,7 @@ function obliBuildPresenterOverlay() {
 
   const rightTextBox = document.createElement('div');
   rightTextBox.id = OB_RIGHT_TEXT_ID;
-  rightTextBox.textContent = overlayTextRight;
+  rightTextBox.textContent = overlayTextRight.trim();
   Object.assign(rightTextBox.style, textBaseStyle, {
     maxWidth: '100%',
     fontSize: 'clamp(13px, 1.25vw, 22px)',
@@ -219,21 +237,16 @@ function obliBuildPresenterOverlay() {
     textAlign: 'left',
   });
 
+  leftColumn.appendChild(lhsCard);
+
   rightColumn.appendChild(heardLine);
   rightColumn.appendChild(rightTextBox);
 
-  leftColumn.appendChild(visualLabel);
-  leftColumn.appendChild(leftTextBox);
-  leftColumn.appendChild(toneTempoLabel);
-  leftColumn.appendChild(leftDeliveryBox);
-  leftColumn.appendChild(briefLabel);
-  leftColumn.appendChild(leftBriefBox);
   leftPanel.appendChild(leftColumn);
   rightPanel.appendChild(rightColumn);
   gridShell.appendChild(leftPanel);
   gridShell.appendChild(centerPanel);
   gridShell.appendChild(rightPanel);
-  overlay.appendChild(listeningBar);
   overlay.appendChild(gridShell);
 
   return overlay;

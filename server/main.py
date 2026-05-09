@@ -7,8 +7,9 @@ import base64
 import json
 import logging
 import os
+import struct
 import sys
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import re
@@ -1251,19 +1252,121 @@ def build_speech_coaching(
     if not offensive and not raised_voice:
         return None
     if offensive and raised_voice:
-        feedback = "Tone down."
+        feedback = "Calm down — watch your language. Soften your volume."
         reason = "language and volume"
     elif offensive:
-        feedback = "Tone down."
+        feedback = "Calm down — watch your language."
         reason = "offensive wording"
     else:
-        feedback = "Lower voice."
+        feedback = "Lower your voice."
         reason = "raised voice"
     return {
         "state": "warning",
         "confidence": 0.95,
         "reason": reason,
         "feedback": feedback,
+    }
+
+
+def wav_duration_seconds(wav: bytes) -> float:
+    """Mono/stereo PCM WAV duration from header + data chunk size."""
+    if len(wav) < 44:
+        return 0.0
+    try:
+        audio_format = struct.unpack_from("<H", wav, 20)[0]
+        channels = struct.unpack_from("<H", wav, 22)[0]
+        sample_rate = struct.unpack_from("<I", wav, 24)[0]
+        bits = struct.unpack_from("<H", wav, 34)[0]
+        if audio_format != 1 or channels < 1 or sample_rate <= 0 or bits <= 0:
+            return 0.0
+        data_size = struct.unpack_from("<I", wav, 40)[0]
+        frame_bytes = channels * (bits // 8)
+        if frame_bytes <= 0:
+            return 0.0
+        return (data_size / frame_bytes) / sample_rate
+    except struct.error:
+        return 0.0
+
+
+def _clamp_int(value: float, low: int, high: int) -> int:
+    return int(max(low, min(high, round(value))))
+
+
+def build_delivery_feedback(
+    text: str,
+    wav_bytes: bytes,
+    audio_rms: Optional[float] = None,
+) -> dict[str, object]:
+    """Heuristic semantic + tempo (+ language / volume) scores for overlay bars."""
+    words = re.findall(r"\w+", (text or "").lower())
+    word_n = len(words)
+    uniq_ratio = len(set(words)) / word_n if word_n else 1.0
+    ctr = Counter(words)
+    highest_share = ctr.most_common(1)[0][1] / word_n if word_n else 0.0
+
+    semantic = 78 + 20 * uniq_ratio
+    if word_n < 4:
+        semantic = 68 + 8 * word_n
+    if highest_share > 0.55 and word_n >= 5:
+        semantic -= 18
+    semantic = _clamp_int(semantic, 35, 96)
+    if semantic >= 82:
+        sem_label = "Clear, distinct wording"
+    elif semantic >= 66:
+        sem_label = "Mostly on track"
+    else:
+        sem_label = "Simplify — less repetition"
+
+    dur = wav_duration_seconds(wav_bytes)
+    wpm = (word_n / dur) * 60.0 if dur >= 0.35 and word_n else 0.0
+    if wpm <= 0:
+        tempo = 72
+        tempo_label = "Speak a bit more to score pace"
+    elif wpm < 95:
+        tempo = _clamp_int(52 + (wpm / 95) * 28, 45, 80)
+        tempo_label = "Pace is slow — add energy"
+    elif wpm < 120:
+        tempo = _clamp_int(76 + (wpm - 95) / 25 * 12, 70, 88)
+        tempo_label = "Comfortable pace"
+    elif wpm <= 155:
+        tempo = _clamp_int(88 + min(8, (wpm - 120) / 35 * 8), 85, 96)
+        tempo_label = "Strong, listener-friendly tempo"
+    elif wpm <= 190:
+        tempo = _clamp_int(96 - (wpm - 155) / 35 * 22, 58, 94)
+        tempo_label = "Slightly rushed — breathe between points"
+    else:
+        tempo = _clamp_int(74 - (wpm - 190) * 0.35, 38, 72)
+        tempo_label = "Too fast — slow down for clarity"
+
+    offensive = transcript_has_offensive_language(text or "")
+    raised_voice = isinstance(audio_rms, (int, float)) and audio_rms >= COACH_RAISED_VOICE_RMS
+
+    if offensive and raised_voice:
+        language_score = 12
+        language_label = "Calm down — watch your language. Soften your volume."
+    elif offensive:
+        language_score = 14
+        language_label = "Calm down — watch your language."
+    elif raised_voice:
+        language_score = 62
+        language_label = "Lower your voice — stay professional."
+    else:
+        language_score = 92
+        language_label = "No profanity flagged in this clip"
+
+    return {
+        "semantic": {"score": semantic, "label": sem_label},
+        "tempo": {
+            "score": tempo,
+            "label": tempo_label,
+            "wpm": round(wpm, 1) if wpm else None,
+        },
+        "language": {
+            "score": language_score,
+            "label": language_label,
+            "offensive": offensive,
+            "raised_voice": raised_voice,
+        },
     }
 
 
@@ -1618,6 +1721,13 @@ async def _run_transcription(payload: IngestIn, api_key: str) -> dict[str, objec
 
     transcript_log.info("%s", text)
 
+    delivery: dict[str, object] | None = None
+    try:
+        wav_for_metrics = prepare_transcription_wav(audio, payload.mimeType or "audio/webm")
+        delivery = build_delivery_feedback(text, wav_for_metrics, payload.audioRms)
+    except Exception:
+        logger.debug("delivery metrics skipped", exc_info=True)
+
     ctx = append_transcript_for_insight(text)
     insight_reply = ""
     if not INSIGHT_DISABLED:
@@ -1661,6 +1771,8 @@ async def _run_transcription(payload: IngestIn, api_key: str) -> dict[str, objec
     speech_coaching = build_speech_coaching(text, payload.audioRms)
     if speech_coaching:
         response["coach"] = speech_coaching
+    if delivery:
+        response["delivery"] = delivery
     return response
 
 

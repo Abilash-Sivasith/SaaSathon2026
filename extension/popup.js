@@ -13,6 +13,8 @@ const transcribeKeyInput = document.getElementById('transcribe-key');
 const transcribeEnabledToggle = document.getElementById('transcribe-enabled');
 const transcribeStatusEl = document.getElementById('transcribe-status');
 const transcriptEl = document.getElementById('transcript');
+const faceEnabledToggle = document.getElementById('face-enabled');
+const faceStatusEl = document.getElementById('face-status');
 const urlParams = new URLSearchParams(window.location.search);
 const isDetachedWindow = urlParams.get('mode') === 'window';
 const sourceTabId = Number(urlParams.get('sourceTabId'));
@@ -20,6 +22,7 @@ const sourceTabId = Number(urlParams.get('sourceTabId'));
 let screenStream  = null; // getDisplayMedia (video + optional system audio)
 let tabStream     = null; // chrome.tabCapture  (tab audio)
 let micStream     = null; // getUserMedia        (microphone)
+let cameraStream  = null; // getUserMedia        (camera)
 
 let audioCtx      = null;
 let rafId         = null;
@@ -47,12 +50,26 @@ let transcribeConfig = {
   enabled: true,
 };
 
+let faceConfig = {
+  enabled: false,
+};
+
 // WebM must exceed server's minimum WAV convert size (~32KB). Larger thresholds → fewer, bigger transcript chunks (no silence/pause detection).
 const TRANSCRIBE_MIN_BYTES = 78000;
 // If we never reach MIN_BYTES (quiet tab), flush whatever we have after this wait.
 const TRANSCRIBE_MAX_INTERVAL_MS = 5000;
 // Mic PCM → WAV periodic flush (~4.5s of audio typical at 48k buffer growth).
 const TRANSCRIBE_PCM_INTERVAL_MS = 4500;
+
+const FACE_CAPTURE_INTERVAL_MS = 3000;
+const FEEDBACK_UPDATE_INTERVAL_MS = 3500;
+const FACE_JPEG_QUALITY = 0.6;
+const FACE_MAX_EDGE = 480;
+const FEEDBACK_HISTORY_SIZE = 7;
+const FEEDBACK_MIN_CONFIDENCE = 0.55;
+const FEEDBACK_STRONG_CONFIDENCE = 0.8;
+const FEEDBACK_STATE_CHANGE_VOTES = 3;
+const FEEDBACK_STATE_SCORE_MARGIN = 0.65;
 
 const TRANSCRIBE_MIN_RMS = 0.002;
 let micTranscribeCtx = null;
@@ -64,14 +81,27 @@ let micPcmSampleRate = 48000;
 
 /** Latest insight keywords from the server; shown in the on-page overlay right panel. */
 let lastOverlayInsight =
-  'Reference hints appear here when speech matches your brief.';
+  'Meeting notes appear here as people speak.';
 const OVERLAY_RIGHT_TEXT_ID = 'obli-overlay-right-text';
 const OVERLAY_RIGHT_HEARD_ID = 'obli-overlay-right-heard';
+const OVERLAY_LEFT_FEEDBACK_ID = 'obli-overlay-left-feedback';
 const OVERLAY_LISTENING_BAR_ID = 'obli-overlay-listening-bar';
 /** Tab id where the overlay was last shown; fixes tab resolution from the extension popup. */
 let overlayInsightTabId = null;
 /** Last finalized transcript shown at top of RHS overlay (red) so the user sees we are listening. */
 let lastOverlayHeardSentence = 'Listening…';
+let lastOverlayFeedbackText = 'Coach: camera idle. Start when ready.';
+let lastOverlayFeedbackState = 'neutral';
+let lastSpokenText = '';
+let lastFeedbackUpdateTs = 0;
+const feedbackHistory = [];
+let acceptedFaceFeedback = null;
+
+let cameraVideo = null;
+let faceInterval = null;
+const faceCanvas = document.createElement('canvas');
+const faceCtx = faceCanvas.getContext('2d');
+let lastFaceFrameB64 = '';
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -87,6 +117,11 @@ function log(msg, cls = '') {
 function setTranscribeStatus(message, isError = false) {
   transcribeStatusEl.textContent = message;
   transcribeStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function setFaceStatus(message, isError = false) {
+  faceStatusEl.textContent = message;
+  faceStatusEl.classList.toggle('error', Boolean(isError));
 }
 
 function appendTranscriptLine(source, text, meta = '') {
@@ -120,6 +155,26 @@ function saveTranscribeConfig() {
   };
   chrome.storage?.local?.set({ transcribeConfig }, () => {
     setTranscribeStatus(transcribeConfig.enabled ? 'Saved' : 'Disabled');
+  });
+}
+
+function loadFaceConfig() {
+  chrome.storage?.local?.get(['faceConfig'], (res) => {
+    if (res?.faceConfig) {
+      faceConfig = { ...faceConfig, ...res.faceConfig };
+    }
+    faceEnabledToggle.checked = Boolean(faceConfig.enabled);
+    setFaceStatus(faceConfig.enabled ? 'Idle' : 'Disabled');
+  });
+}
+
+function saveFaceConfig() {
+  faceConfig = {
+    enabled: Boolean(faceEnabledToggle.checked),
+  };
+  if (!faceConfig.enabled) resetFaceFeedbackSmoothing();
+  chrome.storage?.local?.set({ faceConfig }, () => {
+    setFaceStatus(faceConfig.enabled ? 'Saved' : 'Disabled');
   });
 }
 
@@ -341,6 +396,14 @@ async function drainTranscriptionQueue(label) {
     chunkIndex: item.seq,
     ts: item.ts,
   };
+  payload.audioRms = lastRmsByLabel.mic || 0;
+  if (lastSpokenText) {
+    payload.recentTranscript = lastSpokenText;
+  }
+  if (faceConfig.enabled && lastFaceFrameB64) {
+    payload.imageB64 = lastFaceFrameB64;
+    payload.imageMimeType = 'image/jpeg';
+  }
 
   const headers = { 'Content-Type': 'application/json' };
   if (transcribeConfig.apiKey) {
@@ -364,8 +427,20 @@ async function drainTranscriptionQueue(label) {
       const spoken = (data.text || '').trim();
       appendTranscriptLine(label, data.text || '', data.isFinal ? 'final' : 'partial');
       if (spoken) updateOverlayRightPanelHeard(spoken);
+      if (spoken) lastSpokenText = spoken;
       const insight = data.insight != null ? String(data.insight).trim() : '';
       if (insight) updateOverlayRightPanelInsight(insight);
+      if (data.face) {
+        const stableFeedback = computeStableFaceFeedback(data.face);
+        const now = Date.now();
+        if (stableFeedback.shouldUpdate && now - lastFeedbackUpdateTs >= FEEDBACK_UPDATE_INTERVAL_MS) {
+          lastFeedbackUpdateTs = now;
+          updateOverlayLeftFeedback(stableFeedback.text, stableFeedback.state);
+          setFaceStatus(stableFeedback.text);
+        } else if (stableFeedback.statusText) {
+          setFaceStatus(stableFeedback.statusText);
+        }
+      }
       setTranscribeStatus('Idle');
     }
   } catch (err) {
@@ -405,6 +480,9 @@ transcribeKeyInput.addEventListener('change', saveTranscribeConfig);
 transcribeEnabledToggle.addEventListener('change', saveTranscribeConfig);
 loadTranscribeConfig();
 
+faceEnabledToggle.addEventListener('change', saveFaceConfig);
+loadFaceConfig();
+
 function normalizeCaptureError(err, step) {
   const name = err?.name || '';
   const message = String(err?.message || err || '');
@@ -429,6 +507,24 @@ function normalizeCaptureError(err, step) {
     }
     if (name === 'NotReadableError') {
       return 'Microphone is busy or unavailable. Close apps using it (Zoom/Meet) and retry.';
+    }
+  }
+
+  if (step === 'camera') {
+    if (name === 'NotAllowedError' && msgLower.includes('dismissed')) {
+      return [
+        'Camera permission was dismissed.',
+        'Click Start again and allow camera access in the prompt.',
+      ].join(' ');
+    }
+    if (name === 'NotAllowedError') {
+      return 'Camera permission was denied. Allow camera access for this extension and retry.';
+    }
+    if (name === 'NotFoundError') {
+      return 'No camera was found. Connect/select a camera and retry.';
+    }
+    if (name === 'NotReadableError') {
+      return 'Camera is busy or unavailable. Close apps using it (Zoom/Meet) and retry.';
     }
   }
 
@@ -528,9 +624,10 @@ function cleanupPartialCapture() {
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
+  stopFaceCapture();
 
-  [screenStream, tabStream, micStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
-  screenStream = tabStream = micStream = null;
+  [screenStream, tabStream, micStream, cameraStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
+  screenStream = tabStream = micStream = cameraStream = null;
   packetSeq = 0;
 
   preview.srcObject = null;
@@ -596,6 +693,185 @@ function captureFrame() {
     thumbB64:  b64thumb,        // small JPEG thumbnail
   });
   log(`Frame ${settings.width}x${settings.height} @ ${(settings.frameRate ?? 0).toFixed(0)}fps`, 'log-screen');
+}
+
+function normalizeFaceState(state) {
+  const normalized = String(state || 'neutral').toLowerCase();
+  return ['bored', 'neutral', 'engaged'].includes(normalized) ? normalized : 'neutral';
+}
+
+function normalizeFaceConfidence(confidence) {
+  const value = Number(confidence);
+  if (!Number.isFinite(value)) return 0.5;
+  return Math.max(0, Math.min(1, value));
+}
+
+function formatFaceFeedback(state, reason, feedbackText, confidence = 0.5) {
+  const normalized = normalizeFaceState(state);
+  const normalizedConfidence = normalizeFaceConfidence(confidence);
+  const reasonText = reason ? ` ${reason}` : '';
+
+  if (feedbackText) {
+    return { state: normalized, confidence: normalizedConfidence, text: feedbackText };
+  }
+
+  if (normalized === 'bored') {
+    return {
+      state: 'bored',
+      confidence: normalizedConfidence,
+      text: `Coach: you are looking away and it feels like you are distracted. Come back to the main screen.${reasonText}`,
+    };
+  }
+  if (normalized === 'engaged') {
+    return {
+      state: 'engaged',
+      confidence: normalizedConfidence,
+      text: `Coach: good focus. You are on the right track. Keep it up.${reasonText}`,
+    };
+  }
+  return {
+    state: 'neutral',
+    confidence: normalizedConfidence,
+    text: `Coach: you are almost there. Keep going and focus a bit more.${reasonText}`,
+  };
+}
+
+function computeStableFaceFeedback(face) {
+  const feedback = formatFaceFeedback(face?.state, face?.reason, face?.feedback, face?.confidence);
+  feedbackHistory.push(feedback);
+  if (feedbackHistory.length > FEEDBACK_HISTORY_SIZE) feedbackHistory.shift();
+
+  const scores = { bored: 0, neutral: 0, engaged: 0 };
+  const counts = { bored: 0, neutral: 0, engaged: 0 };
+  feedbackHistory.forEach((item) => {
+    if (scores[item.state] == null) return;
+    scores[item.state] += Math.max(item.confidence, 0.25);
+    counts[item.state] += 1;
+  });
+
+  const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const candidateState = ranked[0]?.[0] || feedback.state;
+  const runnerUpScore = ranked[1]?.[1] || 0;
+  const scoreMargin = scores[candidateState] - runnerUpScore;
+  const recentSameCount = feedbackHistory
+    .slice(-FEEDBACK_STATE_CHANGE_VOTES)
+    .filter((item) => item.state === candidateState && item.confidence >= FEEDBACK_MIN_CONFIDENCE)
+    .length;
+
+  const hasAcceptedFeedback = Boolean(acceptedFaceFeedback);
+  const confidentSameAsAccepted = hasAcceptedFeedback
+    && candidateState === acceptedFaceFeedback.state
+    && feedback.state === candidateState
+    && feedback.confidence >= FEEDBACK_MIN_CONFIDENCE;
+  const strongLatestMatch = feedback.state === candidateState && feedback.confidence >= FEEDBACK_STRONG_CONFIDENCE;
+  const repeatedMatch = recentSameCount >= FEEDBACK_STATE_CHANGE_VOTES;
+  const clearWindowWinner = counts[candidateState] >= FEEDBACK_STATE_CHANGE_VOTES && scoreMargin >= FEEDBACK_STATE_SCORE_MARGIN;
+  const firstUsableFeedback = !hasAcceptedFeedback && (
+    feedback.confidence >= FEEDBACK_MIN_CONFIDENCE ||
+    feedbackHistory.length >= Math.min(3, FEEDBACK_HISTORY_SIZE)
+  );
+
+  const shouldAccept = confidentSameAsAccepted
+    || firstUsableFeedback
+    || strongLatestMatch
+    || repeatedMatch
+    || clearWindowWinner;
+
+  if (shouldAccept) {
+    const textSource = feedback.state === candidateState
+      ? feedback
+      : [...feedbackHistory].reverse().find((item) => item.state === candidateState) || feedback;
+    acceptedFaceFeedback = {
+      state: candidateState,
+      text: textSource.text,
+      confidence: textSource.confidence,
+    };
+    return {
+      state: acceptedFaceFeedback.state,
+      text: acceptedFaceFeedback.text,
+      shouldUpdate: true,
+      statusText: '',
+    };
+  }
+
+  return {
+    state: acceptedFaceFeedback?.state || lastOverlayFeedbackState || 'neutral',
+    text: acceptedFaceFeedback?.text || lastOverlayFeedbackText,
+    shouldUpdate: false,
+    statusText: 'Watching for a stable face signal…',
+  };
+}
+
+function resetFaceFeedbackSmoothing() {
+  feedbackHistory.length = 0;
+  acceptedFaceFeedback = null;
+  lastFeedbackUpdateTs = 0;
+}
+
+function captureAndStoreFaceFrame() {
+  if (!faceConfig.enabled || !cameraVideo) return;
+  if (!cameraVideo.videoWidth || !cameraVideo.videoHeight) return;
+
+  const srcW = cameraVideo.videoWidth;
+  const srcH = cameraVideo.videoHeight;
+  const scale = Math.min(1, FACE_MAX_EDGE / Math.max(srcW, srcH));
+  const dstW = Math.max(1, Math.round(srcW * scale));
+  const dstH = Math.max(1, Math.round(srcH * scale));
+  faceCanvas.width = dstW;
+  faceCanvas.height = dstH;
+  faceCtx.drawImage(cameraVideo, 0, 0, dstW, dstH);
+
+  const dataUrl = faceCanvas.toDataURL('image/jpeg', FACE_JPEG_QUALITY);
+  lastFaceFrameB64 = dataUrl.split(',')[1];
+  if (!acceptedFaceFeedback && feedbackHistory.length === 0) {
+    setFaceStatus('Camera active');
+  }
+}
+
+async function startFaceCapture() {
+  if (!faceConfig.enabled) return;
+  if (cameraStream) return;
+  if (!transcribeConfig.endpoint) {
+    setFaceStatus('Missing endpoint URL', true);
+    return;
+  }
+  resetFaceFeedbackSmoothing();
+  setFaceStatus('Starting camera…');
+  cameraStream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: 'user',
+      width: { ideal: 640 },
+      height: { ideal: 360 },
+    },
+    audio: false,
+  });
+  cameraVideo = document.createElement('video');
+  cameraVideo.autoplay = true;
+  cameraVideo.muted = true;
+  cameraVideo.playsInline = true;
+  cameraVideo.srcObject = cameraStream;
+  await cameraVideo.play();
+  setFaceStatus('Camera active');
+  captureAndStoreFaceFrame();
+  faceInterval = setInterval(captureAndStoreFaceFrame, FACE_CAPTURE_INTERVAL_MS);
+}
+
+function stopFaceCapture() {
+  if (faceInterval) {
+    clearInterval(faceInterval);
+    faceInterval = null;
+  }
+  if (cameraVideo) {
+    cameraVideo.srcObject = null;
+    cameraVideo = null;
+  }
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(t => t.stop());
+    cameraStream = null;
+  }
+  lastFaceFrameB64 = '';
+  resetFaceFeedbackSmoothing();
+  setFaceStatus('Idle');
 }
 
 // ── MediaRecorder setup ───────────────────────────────────────────────────────
@@ -713,6 +989,14 @@ async function startCapture() {
       startMicTranscription(micStream);
     }
 
+    // 2.5 Camera (optional)
+    if (faceConfig.enabled) {
+      currentStep = 'camera';
+      log('Requesting camera…', 'log-audio');
+      await startFaceCapture();
+      emitEvent('capture_start', { source: 'camera' });
+    }
+
     // 3. Screen (video + system audio if the OS/browser allows it)
     currentStep = 'screen';
     log('Requesting screen capture…', 'log-screen');
@@ -802,6 +1086,7 @@ async function stopCapture() {
     console.error(err);
     log(`Stop encountered an issue: ${err?.message || err}`, 'log-error');
   } finally {
+    stopFaceCapture();
     stopMicTranscription();
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
     if (tabMonitorNodes) {
@@ -816,8 +1101,8 @@ async function stopCapture() {
     if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
     if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
 
-    [screenStream, tabStream, micStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
-    screenStream = tabStream = micStream = null;
+    [screenStream, tabStream, micStream, cameraStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
+    screenStream = tabStream = micStream = cameraStream = null;
     packetSeq = 0;
 
     preview.srcObject = null;
@@ -905,6 +1190,47 @@ function updateOverlayRightPanelInsight(insightText) {
   });
 }
 
+function updateOverlayLeftFeedback(feedbackText, feedbackState) {
+  const text = String(feedbackText || '').trim();
+  if (!text) return;
+  lastOverlayFeedbackText = text;
+  if (feedbackState) lastOverlayFeedbackState = feedbackState;
+  runOnInsightTargetTab((tab) => {
+    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_LEFT_FEEDBACK_ID, text);
+    setOverlayLeftFeedbackColor(tab?.id, tab?.url || '', lastOverlayFeedbackState);
+  });
+}
+
+function setOverlayLeftFeedbackColor(tabId, tabUrl, state) {
+  if (!Number.isInteger(tabId)) return;
+  if (
+    tabUrl.startsWith('chrome://') ||
+    tabUrl.startsWith('chrome-extension://') ||
+    tabUrl.startsWith('edge://') ||
+    tabUrl.startsWith('about:')
+  ) {
+    return;
+  }
+  const color = state === 'engaged'
+    ? '#5fe075'
+    : state === 'bored'
+      ? '#ff6b6b'
+      : '#ffd54f';
+  chrome.scripting.executeScript(
+    {
+      target: { tabId },
+      func: (id, nextColor) => {
+        const el = document.getElementById(id);
+        if (el) el.style.color = nextColor;
+      },
+      args: [OVERLAY_LEFT_FEEDBACK_ID, color],
+    },
+    () => {
+      void chrome.runtime.lastError;
+    }
+  );
+}
+
 function openDetachedWindow() {
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
     const activeId = tabs?.[0]?.id;
@@ -949,7 +1275,15 @@ function toggleOverlay() {
     chrome.scripting.executeScript(
       {
         target: { tabId },
-        func: (overlayTextLeft, overlayTextRight, rightTextId, heardTextId, heardInitial, listeningBarId) => {
+        func: (
+          overlayTextLeft,
+          overlayTextRight,
+          leftTextId,
+          rightTextId,
+          heardTextId,
+          heardInitial,
+          listeningBarId
+        ) => {
           const OVERLAY_ID = 'obli-overlay-poc';
           const existing = document.getElementById(OVERLAY_ID);
           if (existing) {
@@ -1039,8 +1373,15 @@ function toggleOverlay() {
           };
 
           const leftTextBox = document.createElement('div');
+          leftTextBox.id = leftTextId;
           leftTextBox.textContent = overlayTextLeft;
-          Object.assign(leftTextBox.style, textBaseStyle);
+          Object.assign(leftTextBox.style, textBaseStyle, {
+            fontSize: 'clamp(13px, 1.25vw, 22px)',
+            lineHeight: '1.35',
+            textAlign: 'left',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+          });
 
           const rightColumn = document.createElement('div');
           Object.assign(rightColumn.style, {
@@ -1098,8 +1439,9 @@ function toggleOverlay() {
           return { state: 'added' };
         },
         args: [
-          'Obli',
+          lastOverlayFeedbackText,
           lastOverlayInsight,
+          OVERLAY_LEFT_FEEDBACK_ID,
           OVERLAY_RIGHT_TEXT_ID,
           OVERLAY_RIGHT_HEARD_ID,
           lastOverlayHeardSentence,
@@ -1126,6 +1468,7 @@ function toggleOverlay() {
         if (state === 'added') {
           overlayInsightTabId = capturedTabId;
           log('Transparent overlay preview shown on active tab.', 'log-screen');
+          setOverlayLeftFeedbackColor(tabId, tabUrl, lastOverlayFeedbackState);
         } else if (state === 'removed') {
           overlayInsightTabId = null;
           log('Transparent overlay preview removed.', 'log-screen');

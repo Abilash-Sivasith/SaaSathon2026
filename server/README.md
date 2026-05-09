@@ -32,41 +32,48 @@ The server listens on `http://localhost:8000`. Interactive docs are available at
 
 Liveness probe. Returns `{"status": "ok"}`.
 
-### `POST /transcripts`
+### `POST /ingest`
 
-Accepts a transcribed utterance from the extension. Logs it and returns an ack.
+Unified endpoint for audio transcription and face analysis (send one or both in the same request).
 
 Request body:
 
 ```json
 {
-  "text": "hello world",
+  "audioB64": "...",
+  "filename": "mic-12.webm",
+  "mimeType": "audio/webm",
+  "chunkIndex": 12,
+  "imageB64": "...",
+  "imageMimeType": "image/jpeg",
   "source": "mic",
-  "language": "en-US",
-  "is_final": true,
-  "client_ts": 1715260800000,
-  "session_id": "abc-123"
+  "ts": 1715260800000
 }
 ```
-
-Only `text` is required.
 
 Response:
 
 ```json
 {
   "ok": true,
-  "received_chars": 11,
-  "server_ts": "2026-05-09T19:00:00+00:00"
+  "isFinal": true,
+  "text": "hello world",
+  "insight": "PDF · signing · AI",
+  "face": {
+    "state": "bored",
+    "confidence": 0.72,
+    "reason": "low engagement"
+  }
 }
 ```
+Legacy endpoints `/transcribe` and `/face` still exist, but `/ingest` is the preferred unified path.
 
 ## Quick test
 
 ```bash
-curl -X POST http://localhost:8000/transcripts \
+curl -X POST http://localhost:8000/ingest \
   -H 'Content-Type: application/json' \
-  -d '{"text":"hello from curl","source":"mic","is_final":true}'
+  -d '{"audioB64":"...","mimeType":"audio/webm"}'
 ```
 
 You should see a log line on the server like:
@@ -81,10 +88,10 @@ You should see a log line on the server like:
 From the extension's background service worker (or popup), POST JSON like:
 
 ```js
-fetch('http://localhost:8000/transcripts', {
+fetch('http://localhost:8000/ingest', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ text: transcribedString, source: 'mic', is_final: true }),
+  body: JSON.stringify({ audioB64, imageB64, mimeType: 'audio/webm', imageMimeType: 'image/jpeg' }),
 });
 ```
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import sys
@@ -151,6 +152,9 @@ INSIGHT_DISABLED = os.getenv("INSIGHT_DISABLED", "0").strip().lower() in ("1", "
 # By default do not duplicate insights on stderr; extension shows them in the page overlay.
 INSIGHT_LOG_TERMINAL = os.getenv("INSIGHT_LOG_TERMINAL", "0").strip().lower() in ("1", "true", "yes")
 WEBM_TRANSCRIBE_MIN_BYTES = int(os.getenv("WEBM_TRANSCRIBE_MIN_BYTES", "32000"))
+FACE_MODEL = os.getenv("OPENAI_FACE_MODEL", "gpt-4o-mini")
+FACE_DISABLED = os.getenv("FACE_DISABLED", "0").strip().lower() in ("1", "true", "yes")
+FACE_IMAGE_MAX_BYTES = int(os.getenv("FACE_IMAGE_MAX_BYTES", "1500000"))
 
 STRIP_FILLER_WORDS = os.getenv("STRIP_FILLER_WORDS", "1").strip().lower() not in ("0", "false", "no")
 
@@ -256,13 +260,17 @@ app.add_middleware(
 )
 
 
-class TranscribeIn(BaseModel):
-    audioB64: str
+class IngestIn(BaseModel):
+    audioB64: Optional[str] = None
+    imageB64: Optional[str] = None
     filename: str = "audio.webm"
     source: str = "unknown"
-    mimeType: str = "audio/webm"
+    mimeType: Optional[str] = "audio/webm"
+    imageMimeType: str = "image/jpeg"
     chunkIndex: int | str = Field(default="?")
     ts: Optional[int] = None
+    audioRms: Optional[float] = None
+    recentTranscript: Optional[str] = None
 
 
 def resolve_api_key(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
@@ -337,6 +345,112 @@ def transcribe_bytes(
     return (text or "").strip()
 
 
+def _strip_data_url(b64_or_data_url: str) -> str:
+    if not b64_or_data_url:
+        return ""
+    if "," in b64_or_data_url and b64_or_data_url.strip().lower().startswith("data:"):
+        return b64_or_data_url.split(",", 1)[1].strip()
+    return b64_or_data_url.strip()
+
+
+def _parse_face_response(raw: str) -> dict[str, object]:
+    text = (raw or "").strip()
+    if not text:
+        return {"state": "neutral", "confidence": 0.5, "reason": "empty_response", "feedback": ""}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return {"state": "neutral", "confidence": 0.5, "reason": "parse_failed", "feedback": ""}
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {"state": "neutral", "confidence": 0.5, "reason": "parse_failed", "feedback": ""}
+
+    state = str(data.get("state", "neutral")).strip().lower()
+    if state not in ("bored", "neutral", "engaged"):
+        state = "neutral"
+
+    confidence = data.get("confidence", 0.5)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
+    reason = str(data.get("reason", "")).strip()
+    feedback = str(data.get("feedback", "")).strip()
+    return {"state": state, "confidence": confidence, "reason": reason, "feedback": feedback}
+
+
+def analyze_face_image(
+    api_key: str,
+    image_b64: str,
+    mime_type: str,
+    audio_rms: Optional[float] = None,
+    recent_transcript: Optional[str] = None,
+) -> dict[str, object]:
+    client = OpenAI(api_key=api_key)
+    data_url = f"data:{mime_type};base64,{image_b64}"
+    audio_tone = "unknown"
+    if isinstance(audio_rms, (int, float)):
+        if audio_rms < 0.01:
+            audio_tone = "calm"
+        elif audio_rms < 0.03:
+            audio_tone = "neutral"
+        else:
+            audio_tone = "intense"
+    prompt = (
+        "Classify visible meeting engagement using only observable cues from the face image, "
+        "recent transcript, and audio tone. Output JSON only with keys: state, confidence, reason, feedback. "
+        "state must be bored|neutral|engaged. confidence is 0-1. "
+        "Use lower confidence (0.2-0.45) when the face is unclear, occluded, off-camera, or the cue is ambiguous. "
+        "reason is 2-6 words describing visible cues only. "
+        "feedback is 1-2 short coaching sentences that are supportive, specific, and action-oriented. "
+        "Avoid diagnosing emotions or personality; coach the next visible behavior instead. "
+        "No extra text."
+    )
+    transcript = (recent_transcript or "").strip() or "(none)"
+    tone_line = f"Audio tone: {audio_tone}."
+    transcript_line = f"Recent transcript: {transcript}"
+    request_kwargs = {
+        "model": FACE_MODEL,
+        "temperature": 0.0,
+        "max_tokens": 120,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conservative visual engagement coach. "
+                    "Prefer neutral with modest confidence when evidence is weak."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"{prompt}\n{tone_line}\n{transcript_line}"},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+    }
+    try:
+        out = client.chat.completions.create(
+            **request_kwargs,
+            response_format={"type": "json_object"},
+        )
+    except TypeError:
+        out = client.chat.completions.create(**request_kwargs)
+    except APIStatusError as exc:
+        message = str(exc).lower()
+        if exc.status_code != 400 or "response_format" not in message:
+            raise
+        out = client.chat.completions.create(**request_kwargs)
+    body = out.choices[0].message.content or ""
+    return _parse_face_response(body)
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -351,16 +465,9 @@ async def root() -> dict[str, object]:
     }
 
 
-@app.post("/transcribe")
-async def transcribe(
-    payload: TranscribeIn,
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-) -> dict[str, object]:
-    api_key = resolve_api_key(authorization, x_api_key)
-    if not api_key:
-        raise HTTPException(status_code=401, detail={"error": "missing_openai_api_key"})
+async def _run_transcription(payload: IngestIn, api_key: str) -> dict[str, object]:
+    if not payload.audioB64:
+        return {"ok": True, "isFinal": False, "text": "", "insight": ""}
 
     try:
         audio = base64.b64decode(payload.audioB64)
@@ -371,7 +478,7 @@ async def transcribe(
         text = await asyncio.to_thread(
             transcribe_then_clean,
             audio,
-            payload.mimeType,
+            payload.mimeType or "audio/webm",
             payload.filename,
             api_key,
         )
@@ -434,6 +541,113 @@ async def transcribe(
             logger.warning("insight model returned an empty reply (model=%s)", INSIGHT_MODEL)
 
     return {"ok": True, "isFinal": True, "text": text, "insight": insight_reply}
+
+
+async def _run_face_analysis(payload: IngestIn, api_key: str) -> dict[str, object]:
+    if FACE_DISABLED or not payload.imageB64:
+        return {}
+
+    raw_b64 = _strip_data_url(payload.imageB64)
+    try:
+        image_bytes = base64.b64decode(raw_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail={"error": "invalid_base64"})
+
+    if len(image_bytes) > FACE_IMAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "image_too_large", "max_bytes": FACE_IMAGE_MAX_BYTES},
+        )
+
+    mime_type = payload.imageMimeType or payload.mimeType or "image/jpeg"
+    try:
+        result = await asyncio.to_thread(
+            analyze_face_image,
+            api_key,
+            raw_b64,
+            mime_type,
+            payload.audioRms,
+            payload.recentTranscript,
+        )
+    except APIStatusError as exc:
+        if exc.status_code == 401:
+            raise HTTPException(
+                status_code=401,
+                detail={"error": "invalid_openai_api_key", "message": "OpenAI returned 401; key missing or wrong."},
+            ) from exc
+        logger.exception("OpenAI face analysis failed")
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "openai_request_failed", "message": str(exc)},
+        ) from exc
+    except Exception as exc:
+        logger.exception("OpenAI face analysis failed")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "openai_request_failed", "message": str(exc)},
+        ) from exc
+
+    return {"face": result}
+
+
+@app.post("/ingest")
+async def ingest(
+    payload: IngestIn,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+) -> dict[str, object]:
+    if not payload.audioB64 and not payload.imageB64:
+        raise HTTPException(status_code=400, detail={"error": "missing_payload"})
+
+    if payload.imageB64 and FACE_DISABLED and not payload.audioB64:
+        return {"ok": False, "error": "face_disabled"}
+
+    api_key = resolve_api_key(authorization, x_api_key)
+    if not api_key:
+        raise HTTPException(status_code=401, detail={"error": "missing_openai_api_key"})
+
+    tasks = []
+    if payload.audioB64:
+        tasks.append(_run_transcription(payload, api_key))
+    if payload.imageB64 and not FACE_DISABLED:
+        tasks.append(_run_face_analysis(payload, api_key))
+
+    if not tasks:
+        raise HTTPException(status_code=400, detail={"error": "missing_payload"})
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    response: dict[str, object] = {"ok": True}
+    for res in results:
+        if isinstance(res, HTTPException):
+            raise res
+        if isinstance(res, Exception):
+            raise HTTPException(status_code=500, detail={"error": "processing_failed", "message": str(res)})
+        response.update(res)
+
+    return response
+
+
+@app.post("/transcribe")
+async def transcribe(
+    payload: IngestIn,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+) -> dict[str, object]:
+    return await ingest(payload, request, authorization, x_api_key)
+
+
+@app.post("/face")
+async def face_analyze(
+    payload: IngestIn,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+) -> dict[str, object]:
+    if not payload.imageB64:
+        raise HTTPException(status_code=400, detail={"error": "missing_image"})
+    return await ingest(payload, request, authorization, x_api_key)
 
 
 if __name__ == "__main__":

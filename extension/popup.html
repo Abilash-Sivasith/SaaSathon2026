@@ -247,10 +247,10 @@
     </div>
 
     <div class="section" id="transcription">
-      <h4>Live Transcription (Backend)</h4>
+      <h4>Ingest Endpoint (Audio + Face)</h4>
       <div class="field">
         <label for="transcribe-endpoint">Endpoint URL</label>
-        <input id="transcribe-endpoint" type="text" placeholder="http://localhost:8000/transcribe" />
+        <input id="transcribe-endpoint" type="text" placeholder="http://localhost:8000/ingest" />
       </div>
       <div class="field">
         <label for="transcribe-key">API Key (optional)</label>
@@ -262,6 +262,15 @@
       </div>
       <div class="status" id="transcribe-status">Idle</div>
       <div id="transcript"></div>
+    </div>
+
+    <div class="section" id="face-analysis">
+      <h4>Face Analysis (Server)</h4>
+      <div class="inline">
+        <input id="face-enabled" type="checkbox" />
+        <label for="face-enabled">Enable face analysis</label>
+      </div>
+      <div class="status" id="face-status">Idle</div>
     </div>
 
     <script src="popup.js"></script>

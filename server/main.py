@@ -1,4 +1,4 @@
-"""FastAPI server: receives audio from the extension, transcribes via OpenAI, logs each finalized transcript line and (unless disabled) an insight LLM reply built with reference_context.txt."""
+"""FastAPI server: receives audio from the extension, transcribes via OpenAI, logs each finalized transcript line and (unless disabled) an insight LLM reply built with context.txt."""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ class ReferenceChunk:
 
 def _resolve_reference_path() -> Path:
     raw = os.getenv("INSIGHT_REFERENCE_PATH", "").strip()
-    path = Path(raw) if raw else _server_dir / "reference_context.txt"
+    path = Path(raw) if raw else _server_dir / "context.txt"
     if not path.is_absolute():
         path = _server_dir / path
     return path
@@ -1419,18 +1419,15 @@ def prepare_transcription_wav(audio: bytes, mime_type: str) -> bytes:
         return out_path.read_bytes()
 
 
-INSIGHT_REASON_SYSTEM = (
-    "You support live captions. You receive RETRIEVED INTERNAL REFERENCE EXCERPTS plus the transcript.\n\n"
-    "Output MUST be keyword-only bullets for a live sales cue card:\n"
-    "- Use only facts supported by the retrieved reference excerpts. Do not guess from general knowledge.\n"
-    "- Return 1-3 bullets. Each bullet starts with `• ` and uses short keyword phrases separated by ` | `.\n"
-    "- No full sentences, no explanations, no filler words.\n"
-    "- Use fragments, not full sentences. No paragraphs, headings, explanations, or markdown lists besides `•`.\n"
-    "- Only include fields that match the new finalized segment topic.\n"
-    "- No names, rapport, bios, or extra topics unless clearly named in this segment.\n"
-    "- If the retrieved excerpts do not directly support useful keywords for this segment: output exactly: ok\n"
-    "- Examples: `• $100/month/user`, `• max discount 20%`, `• PDF reading + signing + AI`."
-)
+def _insight_llm_system_prompt() -> str:
+    """System instructions for the insight LLM: full body of the configured context file (default context.txt)."""
+    text = get_reference_document().strip()
+    if text:
+        return text
+    return (
+        "You help with a live meeting. Use only facts from the supplied reference excerpts; "
+        "if nothing applies, reply exactly: ok"
+    )
 
 
 def synthesize_insight(
@@ -1453,7 +1450,7 @@ def synthesize_insight(
     out = client.chat.completions.create(
         model=INSIGHT_MODEL,
         messages=[
-            {"role": "system", "content": INSIGHT_REASON_SYSTEM},
+            {"role": "system", "content": _insight_llm_system_prompt()},
             {"role": "user", "content": user_content},
         ],
         temperature=0.0,
@@ -1471,7 +1468,7 @@ def insight_is_skip_token(text: str) -> bool:
 
 app = FastAPI(
     title="SaaSathon2026 Transcript Server",
-    description="Transcribes audio from the extension; logs each chunk on logger transcription-text, then insights on insight-llm using reference_context.txt.",
+    description="Transcribes audio from the extension; logs each chunk on logger transcription-text, then insights on insight-llm using context.txt.",
     version="0.3.4",
 )
 

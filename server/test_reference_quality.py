@@ -19,6 +19,9 @@ SERVER_DIR = Path(__file__).resolve().parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
+# Quality script targets the rich keyed reference file; production default is context.txt.
+os.environ["INSIGHT_REFERENCE_PATH"] = str(SERVER_DIR / "reference_context.txt")
+
 import main  # noqa: E402
 
 

@@ -1,6 +1,6 @@
 /**
  * Presenter overlay — optional content script parity with extension/popup.js `toggleOverlay`.
- * Element IDs MUST match popup.js LHS meter IDs so `flushPresenterLhsMeters` can repaint bars.
+ * Element IDs MUST match popup.js (LHS meter IDs + RHS hint stack) so injection stays aligned.
  */
 const OB_OVERLAY_ID = 'obli-overlay';
 const OB_LHS_SEMANTIC_FILL_ID = 'obli-overlay-lhs-semantic-fill';
@@ -13,6 +13,7 @@ const OB_LHS_LANGUAGE_FILL_ID = 'obli-overlay-lhs-language-fill';
 const OB_LHS_LANGUAGE_CAP_ID = 'obli-overlay-lhs-language-cap';
 const OB_RIGHT_TEXT_ID = 'obli-overlay-right-text';
 const OB_HEARD_TEXT_ID = 'obli-overlay-right-heard';
+const OB_RHS_HINT_STACK_ID = 'obli-overlay-rhs-hint-stack';
 
 function obliCanInjectOverlay() {
   const proto = location.protocol;
@@ -120,6 +121,7 @@ function obliBuildPresenterOverlay() {
     marginTop: '5px',
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-word',
+    transition: 'color 480ms ease, opacity 480ms ease',
   };
 
   const makeBarBlock = (titleText, fillId, capId, captionText) => {
@@ -143,7 +145,7 @@ function obliBuildPresenterOverlay() {
       height: '100%',
       width: '45%',
       borderRadius: '4px',
-      transition: 'width 220ms ease, background 180ms ease',
+      transition: 'width 680ms ease, background 420ms ease',
       background: '#ef6c00',
     });
 
@@ -195,6 +197,29 @@ function obliBuildPresenterOverlay() {
     )
   );
 
+  const hintSection = document.createElement('div');
+  Object.assign(hintSection.style, {
+    ...textBaseStyle,
+    padding: '10px 12px',
+    textAlign: 'left',
+    maxWidth: '100%',
+  });
+  const hintHeading = document.createElement('div');
+  hintHeading.textContent = 'Live hints';
+  Object.assign(hintHeading.style, labelStyle);
+  const hintStack = document.createElement('div');
+  hintStack.id = OB_RHS_HINT_STACK_ID;
+  Object.assign(hintStack.style, {
+    maxHeight: '26vh',
+    overflowY: 'auto',
+    marginTop: '6px',
+    fontSize: 'clamp(11px, 1vw, 14px)',
+    fontWeight: '600',
+    lineHeight: '1.42',
+  });
+  hintSection.appendChild(hintHeading);
+  hintSection.appendChild(hintStack);
+
   const rightColumn = document.createElement('div');
   Object.assign(rightColumn.style, {
     display: 'flex',
@@ -240,6 +265,7 @@ function obliBuildPresenterOverlay() {
   leftColumn.appendChild(lhsCard);
 
   rightColumn.appendChild(heardLine);
+  rightColumn.appendChild(hintSection);
   rightColumn.appendChild(rightTextBox);
 
   leftPanel.appendChild(leftColumn);

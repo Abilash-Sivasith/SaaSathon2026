@@ -45,7 +45,7 @@ const AUDIO_MAX_QUEUE_ITEMS = 1;
 // Visual throttle: slower independent path for coaching, never blocks audio.
 const VISUAL_FRAME_CAPTURE_MS = 3000;
 const VISUAL_ANALYSIS_MS = 5000;
-const FEEDBACK_UPDATE_INTERVAL_MS = 2500;
+const FEEDBACK_UPDATE_INTERVAL_MS = 3500;
 const FACE_JPEG_QUALITY = 0.6;
 const FACE_MAX_EDGE = 480;
 const FEEDBACK_HISTORY_SIZE = 7;
@@ -53,6 +53,13 @@ const FEEDBACK_MIN_CONFIDENCE = 0.55;
 const FEEDBACK_STRONG_CONFIDENCE = 0.8;
 const FEEDBACK_STATE_CHANGE_VOTES = 3;
 const FEEDBACK_STATE_SCORE_MARGIN = 0.65;
+
+/** RHS rolling hint panel: append blocks, expire after TTL, throttle new blocks. */
+const HINT_FEED_TTL_MS = 20000;
+const HINT_FEED_MIN_INTERVAL_MS = 3200;
+const HINT_FEED_TICK_MS = 1000;
+/** Throttle delivery-driven LHS meter repaints (semantic / tempo / wording) so captions change less often. */
+const LHS_METER_FROM_DELIVERY_MS = 3200;
 
 const TRANSCRIBE_MIN_RMS = 0.002;
 let micTranscribeCtx = null;
@@ -62,10 +69,12 @@ let micTranscribeTimer = null;
 let micPcmBuffer = [];
 let micPcmSampleRate = 48000;
 
-/** Latest insight keywords from the server; shown in the on-page overlay right panel. */
+/** Latest insight keywords from the server (used when rebuilding overlay). */
 let lastOverlayInsight = '';
 const OVERLAY_RIGHT_TEXT_ID = 'obli-overlay-right-text';
 const OVERLAY_RIGHT_HEARD_ID = 'obli-overlay-right-heard';
+/** RHS scroll stack for rolling hints. */
+const OVERLAY_RHS_HINT_STACK_ID = 'obli-overlay-rhs-hint-stack';
 /** Presenter LHS meters (semantic / tempo / expression / wording) — same IDs as presenter-overlay.js. */
 const LHS_SEMANTIC_FILL_ID = 'obli-overlay-lhs-semantic-fill';
 const LHS_SEMANTIC_CAP_ID = 'obli-overlay-lhs-semantic-cap';
@@ -81,6 +90,14 @@ let overlayInsightTabId = null;
 let lastOverlayHeardSentence = 'Listening…';
 /** Last ingest `delivery` object from the server (semantic / tempo / language bars). */
 let lastDeliverySnapshot = null;
+/** `{ ts, bullets }` oldest → newest; pruned by age for the rolling RHS panel. */
+let insightHintBlocks = [];
+let lastHintAppendTs = 0;
+let hintAppendTimer = null;
+let pendingQueuedInsight = null;
+let hintFeedTickTimer = null;
+let lhsDeliveryFlushTimer = null;
+let lastLhsDeliveryPaintTs = 0;
 /** Facial expression meter (LHS), updated from `/face`; wording bar comes from ingest. */
 let lastFacialLhs = { score: 68, label: 'Awaiting expression signal…' };
 let lastSpokenText = '';
@@ -349,7 +366,7 @@ async function drainTranscriptionQueue(label) {
       if (insight) updateOverlayRightPanelInsight(insight);
       if (data.delivery) {
         lastDeliverySnapshot = data.delivery;
-        flushPresenterLhsMeters();
+        scheduleLhsMetersFromDelivery();
       }
       if (data.coach) applySpeechCoachingResult(data.coach);
     }
@@ -533,9 +550,23 @@ function cleanupPartialCapture() {
 
   lastDeliverySnapshot = null;
   lastOverlayInsight = '';
+  stopHintFeedTicker();
+  if (hintAppendTimer) {
+    clearTimeout(hintAppendTimer);
+    hintAppendTimer = null;
+  }
+  if (lhsDeliveryFlushTimer) {
+    clearTimeout(lhsDeliveryFlushTimer);
+    lhsDeliveryFlushTimer = null;
+  }
+  lastLhsDeliveryPaintTs = 0;
+  insightHintBlocks = [];
+  pendingQueuedInsight = null;
+  lastHintAppendTs = 0;
   flushPresenterLhsMeters();
   runOnInsightTargetTab((tab) => {
     injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_TEXT_ID, '');
+    injectOverlayHintFeed(tab?.id, tab?.url || '', OVERLAY_RHS_HINT_STACK_ID, []);
   });
 
   startBtn.disabled = false;
@@ -1058,6 +1089,171 @@ function runOnInsightTargetTab(callback) {
   runOnActiveWebTab(callback);
 }
 
+function splitInsightIntoBullets(text) {
+  const t = String(text || '').trim();
+  if (!t) return [];
+  if (t.includes('\n') || t.includes('•')) {
+    return t
+      .split(/\n+/)
+      .map((line) => line.trim().replace(/^[-•]\s*/, ''))
+      .filter(Boolean)
+      .slice(0, 12);
+  }
+  return [t];
+}
+
+function insightTextIsSkipToken(text) {
+  const t = String(text || '').trim().toLowerCase().replace(/[.!?]+$/, '');
+  return !t || t === 'ok' || t === 'okay';
+}
+
+function pruneInsightHintBlocks() {
+  const now = Date.now();
+  insightHintBlocks = insightHintBlocks.filter((b) => now - b.ts <= HINT_FEED_TTL_MS);
+}
+
+function ensureHintFeedTicker() {
+  if (hintFeedTickTimer) return;
+  hintFeedTickTimer = setInterval(() => {
+    const prevLen = insightHintBlocks.length;
+    pruneInsightHintBlocks();
+    if (insightHintBlocks.length !== prevLen) {
+      renderOverlayHintFeed();
+    }
+  }, HINT_FEED_TICK_MS);
+}
+
+function stopHintFeedTicker() {
+  if (hintFeedTickTimer) {
+    clearInterval(hintFeedTickTimer);
+    hintFeedTickTimer = null;
+  }
+}
+
+function scheduleLhsMetersFromDelivery() {
+  const now = Date.now();
+  if (!lastLhsDeliveryPaintTs || now - lastLhsDeliveryPaintTs >= LHS_METER_FROM_DELIVERY_MS) {
+    if (lhsDeliveryFlushTimer) {
+      clearTimeout(lhsDeliveryFlushTimer);
+      lhsDeliveryFlushTimer = null;
+    }
+    lastLhsDeliveryPaintTs = Date.now();
+    flushPresenterLhsMeters();
+    return;
+  }
+  const delay = LHS_METER_FROM_DELIVERY_MS - (now - lastLhsDeliveryPaintTs);
+  if (!lhsDeliveryFlushTimer) {
+    lhsDeliveryFlushTimer = setTimeout(() => {
+      lhsDeliveryFlushTimer = null;
+      lastLhsDeliveryPaintTs = Date.now();
+      flushPresenterLhsMeters();
+    }, delay);
+  }
+}
+
+function lastHintBlockBullets() {
+  if (!insightHintBlocks.length) return null;
+  return insightHintBlocks[insightHintBlocks.length - 1].bullets;
+}
+
+function bulletsEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (String(a[i]).toLowerCase() !== String(b[i]).toLowerCase()) return false;
+  }
+  return true;
+}
+
+function flushQueuedInsightAppend() {
+  hintAppendTimer = null;
+  const raw = pendingQueuedInsight;
+  pendingQueuedInsight = null;
+  if (!raw || insightTextIsSkipToken(raw)) return;
+
+  const bullets = splitInsightIntoBullets(raw);
+  if (!bullets.length) return;
+
+  const prev = lastHintBlockBullets();
+  if (prev && bulletsEqual(prev, bullets)) return;
+
+  pruneInsightHintBlocks();
+  insightHintBlocks.push({ ts: Date.now(), bullets });
+  lastHintAppendTs = Date.now();
+  lastOverlayInsight = raw;
+  renderOverlayHintFeed();
+}
+
+function scheduleInsightHintAppend(text) {
+  const raw = String(text || '').trim();
+  if (!raw || insightTextIsSkipToken(raw)) return;
+
+  ensureHintFeedTicker();
+  pendingQueuedInsight = raw;
+
+  const now = Date.now();
+  const elapsed = now - lastHintAppendTs;
+  if (!lastHintAppendTs || elapsed >= HINT_FEED_MIN_INTERVAL_MS) {
+    if (hintAppendTimer) {
+      clearTimeout(hintAppendTimer);
+      hintAppendTimer = null;
+    }
+    flushQueuedInsightAppend();
+    return;
+  }
+  if (hintAppendTimer) clearTimeout(hintAppendTimer);
+  hintAppendTimer = setTimeout(flushQueuedInsightAppend, HINT_FEED_MIN_INTERVAL_MS - elapsed);
+}
+
+function injectOverlayHintFeed(tabId, tabUrl, stackId, blocks) {
+  if (!Number.isInteger(tabId)) return;
+  if (
+    tabUrl.startsWith('chrome://') ||
+    tabUrl.startsWith('chrome-extension://') ||
+    tabUrl.startsWith('edge://') ||
+    tabUrl.startsWith('about:')
+  ) {
+    return;
+  }
+  chrome.scripting.executeScript(
+    {
+      target: { tabId },
+      func: (id, blocksArg) => {
+        const stack = document.getElementById(id);
+        if (!stack) return;
+        stack.replaceChildren();
+        blocksArg.forEach((bullets) => {
+          const wrap = document.createElement('div');
+          wrap.style.marginTop = '10px';
+          wrap.style.paddingBottom = '8px';
+          wrap.style.borderBottom = '1px solid rgba(255,255,255,0.12)';
+          bullets.forEach((line) => {
+            const row = document.createElement('div');
+            row.textContent = `• ${line}`;
+            row.style.marginBottom = '5px';
+            row.style.fontWeight = '600';
+            row.style.lineHeight = '1.38';
+            wrap.appendChild(row);
+          });
+          stack.appendChild(wrap);
+        });
+        stack.scrollTop = stack.scrollHeight;
+      },
+      args: [stackId, blocks],
+    },
+    () => {
+      void chrome.runtime.lastError;
+    }
+  );
+}
+
+function renderOverlayHintFeed() {
+  pruneInsightHintBlocks();
+  const ordered = insightHintBlocks.map((b) => b.bullets);
+  runOnInsightTargetTab((tab) => {
+    injectOverlayHintFeed(tab?.id, tab?.url || '', OVERLAY_RHS_HINT_STACK_ID, ordered);
+  });
+}
+
 function flushPresenterLhsMeters() {
   const semantic = lastDeliverySnapshot?.semantic;
   const tempoRaw = lastDeliverySnapshot?.tempo;
@@ -1173,12 +1369,7 @@ function injectOverlayTextById(tabId, tabUrl, elementId, content) {
 }
 
 function updateOverlayRightPanelInsight(insightText) {
-  const text = String(insightText || '').trim();
-  if (!text) return;
-  lastOverlayInsight = text;
-  runOnInsightTargetTab((tab) => {
-    injectOverlayTextById(tab?.id, tab?.url || '', OVERLAY_RIGHT_TEXT_ID, text);
-  });
+  scheduleInsightHintAppend(insightText);
 }
 
 function updateOverlayRightPanelHeard(sentence) {
@@ -1233,7 +1424,7 @@ function toggleOverlay() {
     chrome.scripting.executeScript(
       {
         target: { tabId },
-        func: (overlayTextRight, rightTextId, heardTextId, heardInitial, lhs) => {
+        func: (overlayTextRight, rightTextId, heardTextId, heardInitial, lhs, rhsHintStackId) => {
           const OVERLAY_ID = 'obli-overlay';
           const existing = document.getElementById(OVERLAY_ID);
           if (existing) {
@@ -1339,6 +1530,7 @@ function toggleOverlay() {
             marginTop: '5px',
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
+            transition: 'color 480ms ease, opacity 480ms ease',
           };
 
           const makeBarBlock = (titleText, fillId, capId) => {
@@ -1362,7 +1554,7 @@ function toggleOverlay() {
               height: '100%',
               width: '45%',
               borderRadius: '4px',
-              transition: 'width 220ms ease, background 180ms ease',
+              transition: 'width 680ms ease, background 420ms ease',
               background: '#ef6c00',
             });
 
@@ -1394,6 +1586,29 @@ function toggleOverlay() {
           lhsCard.appendChild(tempoBlock);
           lhsCard.appendChild(exprBlock);
           lhsCard.appendChild(wordingBlock);
+
+          const hintSection = document.createElement('div');
+          Object.assign(hintSection.style, {
+            ...textBaseStyle,
+            padding: '10px 12px',
+            textAlign: 'left',
+            maxWidth: '100%',
+          });
+          const hintHeading = document.createElement('div');
+          hintHeading.textContent = 'Live hints';
+          Object.assign(hintHeading.style, labelStyle);
+          const hintStack = document.createElement('div');
+          hintStack.id = rhsHintStackId;
+          Object.assign(hintStack.style, {
+            maxHeight: '26vh',
+            overflowY: 'auto',
+            marginTop: '6px',
+            fontSize: 'clamp(11px, 1vw, 14px)',
+            fontWeight: '600',
+            lineHeight: '1.42',
+          });
+          hintSection.appendChild(hintHeading);
+          hintSection.appendChild(hintStack);
 
           const rightColumn = document.createElement('div');
           Object.assign(rightColumn.style, {
@@ -1435,25 +1650,12 @@ function toggleOverlay() {
             hyphens: 'auto',
             textAlign: 'left',
           });
-          const initialBullets = String(overlayTextRight || '')
-            .split(/\n+/)
-            .map((line) => line.trim().replace(/^[-•]\s*/, ''))
-            .filter(Boolean)
-            .slice(0, 3);
-          if (initialBullets.length) {
-            initialBullets.forEach((bullet) => {
-              const row = document.createElement('div');
-              row.textContent = `• ${bullet}`;
-              row.style.marginBottom = '6px';
-              rightTextBox.appendChild(row);
-            });
-          } else {
-            rightTextBox.textContent = overlayTextRight ? String(overlayTextRight).trim() : '';
-          }
+          rightTextBox.textContent = overlayTextRight ? String(overlayTextRight).trim() : '';
 
           leftColumn.appendChild(lhsCard);
 
           rightColumn.appendChild(heardLine);
+          rightColumn.appendChild(hintSection);
           rightColumn.appendChild(rightTextBox);
 
           leftPanel.appendChild(leftColumn);
@@ -1466,7 +1668,7 @@ function toggleOverlay() {
           return { state: 'added' };
         },
         args: [
-          lastOverlayInsight,
+          '',
           OVERLAY_RIGHT_TEXT_ID,
           OVERLAY_RIGHT_HEARD_ID,
           lastOverlayHeardSentence,
@@ -1480,6 +1682,7 @@ function toggleOverlay() {
             langFill: LHS_LANGUAGE_FILL_ID,
             langCap: LHS_LANGUAGE_CAP_ID,
           },
+          OVERLAY_RHS_HINT_STACK_ID,
         ],
       },
       (results) => {
@@ -1503,8 +1706,10 @@ function toggleOverlay() {
           overlayInsightTabId = capturedTabId;
           log('Transparent overlay preview shown on active tab.', 'log-screen');
           flushPresenterLhsMeters();
+          renderOverlayHintFeed();
         } else if (state === 'removed') {
           overlayInsightTabId = null;
+          stopHintFeedTicker();
           log('Transparent overlay preview removed.', 'log-screen');
         }
       }

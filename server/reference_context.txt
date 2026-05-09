@@ -7,11 +7,13 @@ infers relevance from spoken transcript.
 
 Goals for the assistant (edit as needed):
 - Keywords only — e.g. price talk → something like: $100 · max discount 20% (not prose).
-- Only facts that fit the spoken topic now; bios/names/features stay hidden unless explicitly relevant.
 - When nothing matches: assistant prints ok (skipped in logs).
+- if the user asks about infomation provide that to them
 
 # In Meeting context
-
+- Meeting with Justus. Has bought software from us 1 year ago.
+- About Justus's previous purchases
+    - spend 20k 
 - New Lumin Software costs $100
 - Max discount for customers 20%
 - Product includes PDF reading, signing, and AI Integration
@@ -23,3 +25,10 @@ Goals for the assistant (edit as needed):
     - has 3 kids
     - Good friends with Rocky
     - works with John Doe, who is in the Integration team and bought 100k worth of software last year for his department. 
+
+Meeting Plan:
+- Intro
+    - ask about family 
+    - kids, life 
+    - hobbies
+- Talk about how Lumin software has been working for them prevoupsly

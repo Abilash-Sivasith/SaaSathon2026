@@ -1,0 +1,223 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@source "./main.tsx";
+@source "./components/**/*.tsx";
+@source not "../dist";
+@source not "../node_modules";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --radius: 8px;
+  --color-background: #f4f7f8;
+  --color-foreground: #545454;
+  --color-card: #ffffff;
+  --color-card-foreground: #545454;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #545454;
+  --color-primary: #009EC8;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #e5f8fc;
+  --color-secondary-foreground: #545454;
+  --color-muted: #eef3f5;
+  --color-muted-foreground: #545454;
+  --color-accent: #009EC8;
+  --color-accent-foreground: #ffffff;
+  --color-destructive: #009EC8;
+  --color-destructive-foreground: #ffffff;
+  --color-border: #cddde3;
+  --color-input: #cddde3;
+  --color-ring: #009EC8;
+  --animate-shimmer-slide: shimmer-slide var(--speed) ease-in-out infinite alternate;
+  --animate-spin-around: spin-around calc(var(--speed) * 2) infinite linear;
+  @keyframes shimmer-slide {
+  to {
+    transform: translate(calc(100cqw - 100%), 0);
+    }
+  }
+  @keyframes spin-around {
+  0% {
+    transform: translateZ(0) rotate(0);
+    }
+  15%, 35% {
+    transform: translateZ(0) rotate(90deg);
+    }
+  65%, 85% {
+    transform: translateZ(0) rotate(270deg);
+    }
+  100% {
+    transform: translateZ(0) rotate(360deg);
+    }
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  width: min(100vw, 380px);
+  min-height: 560px;
+  overflow: hidden;
+  background: #f4f7f8;
+  color: var(--color-foreground);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button {
+  font: inherit;
+}
+
+.app-shell {
+  width: min(100vw, 380px);
+}
+
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(128px, 1fr));
+  gap: clamp(7px, 2.4vw, 10px);
+}
+
+.control-button {
+  position: relative;
+  min-width: 0;
+  min-height: clamp(38px, 11vw, 42px);
+  overflow: hidden;
+  border-radius: 8px;
+  padding: clamp(9px, 2.7vw, 11px) clamp(10px, 3vw, 13px);
+  border: 1px solid #009EC8;
+  background: #ffffff;
+  color: #545454;
+  font-size: clamp(12px, 3.4vw, 13px);
+  font-weight: 650;
+  letter-spacing: 0;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  box-shadow: 0 1px 2px rgba(0, 51, 64, 0.06);
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    color 140ms ease,
+    transform 100ms ease,
+    opacity 140ms ease;
+}
+
+@media (max-width: 315px) {
+  .control-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .control-button {
+    white-space: normal;
+  }
+}
+
+.control-button:not(:disabled):hover {
+  background: #e5f8fc;
+  border-color: #009EC8;
+  box-shadow: 0 2px 6px rgba(0, 158, 200, 0.16);
+}
+
+.control-button:not(:disabled):active {
+  transform: translateY(1px);
+  box-shadow: 0 1px 2px rgba(0, 51, 64, 0.08);
+}
+
+.control-button:focus-visible {
+  outline: 2px solid #009EC8;
+  outline-offset: 2px;
+}
+
+.control-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.control-button-start {
+  border-color: #009EC8;
+  background: #009EC8;
+  color: #ffffff;
+}
+
+.control-button-start:not(:disabled):hover {
+  background: #0089ad;
+  border-color: #0089ad;
+}
+
+.control-button-stop {
+  border-color: #009EC8;
+  background: #ffffff;
+  color: #545454;
+}
+
+.control-button-stop:not(:disabled):hover {
+  background: #e5f8fc;
+  border-color: #009EC8;
+}
+
+.control-button-overlay {
+  border-color: #009EC8;
+  background: #ffffff;
+  color: #545454;
+}
+
+.control-button-overlay:not(:disabled):hover {
+  background: #e5f8fc;
+  border-color: #009EC8;
+}
+
+.control-button-panel {
+  border-color: #009EC8;
+  background: #ffffff;
+  color: #545454;
+}
+
+.control-button-panel:not(:disabled):hover {
+  background: #e5f8fc;
+  border-color: #009EC8;
+}
+
+#screen-preview {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+#preview-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #8d98a8;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.meter-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: #009EC8;
+  transition: width 120ms ease;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.52;
+}
+
+button:not(:disabled) {
+  cursor: pointer;
+}

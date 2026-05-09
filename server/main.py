@@ -72,6 +72,7 @@ _FILLER_RE = re.compile(
     r"|\bas i said\b\s*[,;.:]?\s*"
     r"|\bas i was saying\b\s*[,;.:]?\s*"
     r"|\b(?:sort of|kind of)\b\s*[,;.:]?\s*"
+    r"|\b(?:like|kinda|kind of|kinda like|kinda sort of|kinda kinda like)\b\s*[,;.:]?\s*"
     r")",
 )
 

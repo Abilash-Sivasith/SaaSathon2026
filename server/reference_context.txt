@@ -22,3 +22,4 @@ Goals for the assistant (edit as needed):
     - software engineer
     - has 3 kids
     - Good friends with Rocky
+    - works with John Doe, who is in the Integration team and bought 100k worth of software last year for his department. 

@@ -148,6 +148,8 @@ TRANSCRIBE_LANGUAGE_HINT: str | None = None if _tl_hint in ("", "auto") else _tl
 
 INSIGHT_MODEL = os.getenv("OPENAI_INSIGHT_MODEL", "gpt-4o-mini")
 INSIGHT_DISABLED = os.getenv("INSIGHT_DISABLED", "0").strip().lower() in ("1", "true", "yes")
+# By default do not duplicate insights on stderr; extension shows them in the page overlay.
+INSIGHT_LOG_TERMINAL = os.getenv("INSIGHT_LOG_TERMINAL", "0").strip().lower() in ("1", "true", "yes")
 WEBM_TRANSCRIBE_MIN_BYTES = int(os.getenv("WEBM_TRANSCRIBE_MIN_BYTES", "32000"))
 
 STRIP_FILLER_WORDS = os.getenv("STRIP_FILLER_WORDS", "1").strip().lower() not in ("0", "false", "no")
@@ -395,11 +397,12 @@ async def transcribe(
         ) from exc
 
     if not text:
-        return {"ok": True, "isFinal": False, "text": ""}
+        return {"ok": True, "isFinal": False, "text": "", "insight": ""}
 
     transcript_log.info("%s", text)
 
     ctx = append_transcript_for_insight(text)
+    insight_reply = ""
     if not INSIGHT_DISABLED:
         try:
             ref_text = get_reference_document()
@@ -424,11 +427,13 @@ async def transcribe(
             ) from exc
 
         if insight and not insight_is_skip_token(insight):
-            insight_log.info("%s", insight.strip())
+            insight_reply = insight.strip()
+            if INSIGHT_LOG_TERMINAL:
+                insight_log.info("%s", insight_reply)
         elif not insight:
             logger.warning("insight model returned an empty reply (model=%s)", INSIGHT_MODEL)
 
-    return {"ok": True, "isFinal": True, "text": text}
+    return {"ok": True, "isFinal": True, "text": text, "insight": insight_reply}
 
 
 if __name__ == "__main__":

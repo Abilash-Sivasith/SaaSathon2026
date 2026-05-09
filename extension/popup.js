@@ -8,6 +8,11 @@ const placeholder = document.getElementById('preview-placeholder');
 const barTab    = document.getElementById('bar-tab');
 const barMic    = document.getElementById('bar-mic');
 const barSys    = document.getElementById('bar-sys');
+const transcribeEndpointInput = document.getElementById('transcribe-endpoint');
+const transcribeKeyInput = document.getElementById('transcribe-key');
+const transcribeEnabledToggle = document.getElementById('transcribe-enabled');
+const transcribeStatusEl = document.getElementById('transcribe-status');
+const transcriptEl = document.getElementById('transcript');
 const urlParams = new URLSearchParams(window.location.search);
 const isDetachedWindow = urlParams.get('mode') === 'window';
 const sourceTabId = Number(urlParams.get('sourceTabId'));
@@ -28,6 +33,29 @@ let chunkStore     = {};
 let objectUrls     = [];
 let tabMonitorNodes = null;
 
+const transcribeQueues = {};
+const transcribeInFlight = {};
+const transcribeSeq = {};
+const transcribeBuffers = {};
+const transcribeTimers = {};
+const lastRmsByLabel = { tab: 0, mic: 0, system_audio: 0 };
+let transcribeConfig = {
+  endpoint: '',
+  apiKey: '',
+  enabled: true,
+};
+
+const TRANSCRIBE_MIN_BYTES = 64000;
+const TRANSCRIBE_MAX_INTERVAL_MS = 8000;
+const TRANSCRIBE_MIN_RMS = 0.002;
+const TRANSCRIBE_PCM_INTERVAL_MS = 5000;
+let micTranscribeCtx = null;
+let micTranscribeProcessor = null;
+let micTranscribeSource = null;
+let micTranscribeTimer = null;
+let micPcmBuffer = [];
+let micPcmSampleRate = 48000;
+
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -38,6 +66,270 @@ function log(msg, cls = '') {
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
   console.log('[Logger]', msg);
+}
+
+function setTranscribeStatus(message, isError = false) {
+  transcribeStatusEl.textContent = message;
+  transcribeStatusEl.classList.toggle('error', Boolean(isError));
+}
+
+function appendTranscriptLine(source, text, meta = '') {
+  if (!text) return;
+  const line = document.createElement('div');
+  line.className = 'transcript-line';
+  const stamp = new Date().toISOString().slice(11, 19);
+  const suffix = meta ? ` (${meta})` : '';
+  line.textContent = `[${stamp}] ${source}: ${text}${suffix}`;
+  transcriptEl.appendChild(line);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function loadTranscribeConfig() {
+  chrome.storage?.local?.get(['transcribeConfig'], (res) => {
+    if (res?.transcribeConfig) {
+      transcribeConfig = { ...transcribeConfig, ...res.transcribeConfig };
+    }
+    transcribeEndpointInput.value = transcribeConfig.endpoint || '';
+    transcribeKeyInput.value = transcribeConfig.apiKey || '';
+    transcribeEnabledToggle.checked = Boolean(transcribeConfig.enabled);
+    setTranscribeStatus(transcribeConfig.enabled ? 'Idle' : 'Disabled');
+  });
+}
+
+function saveTranscribeConfig() {
+  transcribeConfig = {
+    endpoint: transcribeEndpointInput.value.trim(),
+    apiKey: transcribeKeyInput.value.trim(),
+    enabled: Boolean(transcribeEnabledToggle.checked),
+  };
+  chrome.storage?.local?.set({ transcribeConfig }, () => {
+    setTranscribeStatus(transcribeConfig.enabled ? 'Saved' : 'Disabled');
+  });
+}
+
+function ensureQueue(label) {
+  if (!transcribeQueues[label]) transcribeQueues[label] = [];
+  if (!transcribeSeq[label]) transcribeSeq[label] = 0;
+  if (!transcribeInFlight[label]) transcribeInFlight[label] = false;
+  if (!transcribeBuffers[label]) transcribeBuffers[label] = [];
+}
+
+function enqueueTranscriptionChunk(label, blob, mimeType) {
+  if (!blob || blob.size === 0) return;
+  if (!transcribeConfig.enabled) return;
+  if (!transcribeConfig.endpoint) {
+    setTranscribeStatus('Missing endpoint URL', true);
+    return;
+  }
+
+  ensureQueue(label);
+
+  transcribeBuffers[label].push(blob);
+  const totalBytes = transcribeBuffers[label].reduce((sum, b) => sum + (b?.size || 0), 0);
+
+  if (totalBytes >= TRANSCRIBE_MIN_BYTES) {
+    flushTranscriptionBuffer(label, mimeType);
+    return;
+  }
+
+  if (!transcribeTimers[label]) {
+    transcribeTimers[label] = setTimeout(() => {
+      transcribeTimers[label] = null;
+      flushTranscriptionBuffer(label, mimeType);
+    }, TRANSCRIBE_MAX_INTERVAL_MS);
+  }
+}
+
+function downsampleBuffer(buffer, inputRate, outputRate) {
+  if (outputRate >= inputRate) return buffer;
+  const ratio = inputRate / outputRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+  let offset = 0;
+  for (let i = 0; i < newLen; i++) {
+    const nextOffset = Math.round((i + 1) * ratio);
+    let sum = 0;
+    let count = 0;
+    for (let j = offset; j < nextOffset && j < buffer.length; j++) {
+      sum += buffer[j];
+      count += 1;
+    }
+    result[i] = count ? sum / count : 0;
+    offset = nextOffset;
+  }
+  return result;
+}
+
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function flushMicPcm(label) {
+  if (!micPcmBuffer.length) return;
+  const mergedLen = micPcmBuffer.reduce((sum, b) => sum + b.length, 0);
+  const merged = new Float32Array(mergedLen);
+  let offset = 0;
+  micPcmBuffer.forEach((b) => {
+    merged.set(b, offset);
+    offset += b.length;
+  });
+  micPcmBuffer = [];
+
+  const rms = lastRmsByLabel[label] ?? 0;
+  if (rms < TRANSCRIBE_MIN_RMS) {
+    return;
+  }
+
+  const downsampled = downsampleBuffer(merged, micPcmSampleRate, 16000);
+  const wavBlob = encodeWav(downsampled, 16000);
+  enqueueTranscriptionChunk(label, wavBlob, 'audio/wav');
+}
+
+function startMicTranscription(stream) {
+  if (micTranscribeCtx) return;
+  micTranscribeCtx = new AudioContext();
+  micPcmSampleRate = micTranscribeCtx.sampleRate;
+  micTranscribeSource = micTranscribeCtx.createMediaStreamSource(stream);
+  micTranscribeProcessor = micTranscribeCtx.createScriptProcessor(4096, 1, 1);
+  micTranscribeSource.connect(micTranscribeProcessor);
+  micTranscribeProcessor.connect(micTranscribeCtx.destination);
+  micTranscribeProcessor.onaudioprocess = (ev) => {
+    const data = ev.inputBuffer.getChannelData(0);
+    micPcmBuffer.push(new Float32Array(data));
+  };
+  micTranscribeTimer = setInterval(() => {
+    flushMicPcm('mic');
+  }, TRANSCRIBE_PCM_INTERVAL_MS);
+}
+
+function stopMicTranscription() {
+  if (micTranscribeTimer) {
+    clearInterval(micTranscribeTimer);
+    micTranscribeTimer = null;
+  }
+  flushMicPcm('mic');
+  if (micTranscribeProcessor) {
+    micTranscribeProcessor.disconnect();
+    micTranscribeProcessor = null;
+  }
+  if (micTranscribeSource) {
+    micTranscribeSource.disconnect();
+    micTranscribeSource = null;
+  }
+  if (micTranscribeCtx) {
+    micTranscribeCtx.close();
+    micTranscribeCtx = null;
+  }
+}
+
+function flushTranscriptionBuffer(label, mimeType) {
+  ensureQueue(label);
+  const parts = transcribeBuffers[label];
+  if (!parts || parts.length === 0) return;
+
+  const combined = new Blob(parts, { type: mimeType || parts[0]?.type || 'audio/webm' });
+  transcribeBuffers[label] = [];
+
+  if (combined.size < TRANSCRIBE_MIN_BYTES) {
+    return;
+  }
+
+  const rms = lastRmsByLabel[label] ?? 0;
+  if (rms < TRANSCRIBE_MIN_RMS) {
+    return;
+  }
+
+  transcribeSeq[label] += 1;
+  transcribeQueues[label].push({
+    seq: transcribeSeq[label],
+    blob: combined,
+    mimeType: combined.type || 'audio/webm',
+    ts: Date.now(),
+  });
+  drainTranscriptionQueue(label);
+}
+
+async function drainTranscriptionQueue(label) {
+  if (transcribeInFlight[label]) return;
+  const queue = transcribeQueues[label];
+  if (!queue || queue.length === 0) return;
+
+  const item = queue.shift();
+  transcribeInFlight[label] = true;
+  setTranscribeStatus(`Transcribing ${label} (chunk ${item.seq})`);
+
+  const arrayBuffer = await item.blob.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  const audioB64 = btoa(binary);
+  const payload = {
+    audioB64,
+    filename: `${label}-${item.seq}.webm`,
+    source: label,
+    mimeType: item.mimeType,
+    chunkIndex: item.seq,
+    ts: item.ts,
+  };
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (transcribeConfig.apiKey) {
+    headers[transcribeConfig.apiKey.startsWith('Bearer ') ? 'Authorization' : 'X-API-Key'] =
+      transcribeConfig.apiKey;
+  }
+
+  try {
+    const res = await fetch(transcribeConfig.endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      setTranscribeStatus(`Transcription error: ${res.status}`, true);
+      log(`Transcription error ${res.status}: ${errText}`, 'log-error');
+    } else {
+      const data = await res.json();
+      appendTranscriptLine(label, data.text || '', data.isFinal ? 'final' : 'partial');
+      setTranscribeStatus('Idle');
+    }
+  } catch (err) {
+    setTranscribeStatus('Transcription network error', true);
+    log(`Transcription network error: ${err?.message || err}`, 'log-error');
+  } finally {
+    transcribeInFlight[label] = false;
+    if (queue.length) drainTranscriptionQueue(label);
+  }
 }
 
 // Structured event ready to POST to a backend later.
@@ -61,6 +353,12 @@ function emitEvent(type, payload) {
 
   return event;
 }
+
+// UI bindings
+transcribeEndpointInput.addEventListener('change', saveTranscribeConfig);
+transcribeKeyInput.addEventListener('change', saveTranscribeConfig);
+transcribeEnabledToggle.addEventListener('change', saveTranscribeConfig);
+loadTranscribeConfig();
 
 function normalizeCaptureError(err, step) {
   const name = err?.name || '';
@@ -263,6 +561,9 @@ function attachRecorder(stream, label) {
     if (!ev.data || ev.data.size === 0) return;
 
     packetSeq += 1;
+    if (!chunkStore[label]) chunkStore[label] = [];
+    chunkStore[label].push(ev.data);
+
     const payload = {
       packetId: packetSeq,
       label,
@@ -273,6 +574,7 @@ function attachRecorder(stream, label) {
       isBlob: ev.data instanceof Blob,
     };
     emitEvent('media_chunk', payload);
+    // Transcription is handled by PCM->WAV pipeline for mic.
     log(
       `Packet #${payload.packetId} [${label}] ${payload.size} bytes ` +
       `mime=${payload.mimeType} data=${payload.constructorName}`,
@@ -292,6 +594,17 @@ function finalizeRecordings() {
     }
   });
   chunkStore = {};
+
+  Object.keys(transcribeQueues).forEach((label) => {
+    transcribeQueues[label].length = 0;
+    transcribeInFlight[label] = false;
+    transcribeBuffers[label] = [];
+    if (transcribeTimers[label]) {
+      clearTimeout(transcribeTimers[label]);
+      transcribeTimers[label] = null;
+    }
+  });
+  setTranscribeStatus('Idle');
 
   objectUrls.forEach((url) => {
     try {
@@ -332,6 +645,9 @@ async function startCapture() {
     log('Requesting microphone…', 'log-audio');
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     emitEvent('capture_start', { source: 'microphone' });
+    if (transcribeConfig.enabled) {
+      startMicTranscription(micStream);
+    }
 
     // 3. Screen (video + system audio if the OS/browser allows it)
     currentStep = 'screen';
@@ -369,6 +685,10 @@ async function startCapture() {
       const tabRms = rms(tabAnalyser);
       const micRms = micAnalyser ? rms(micAnalyser) : 0;
       const sysRms = sysAnalyser ? rms(sysAnalyser) : 0;
+
+      lastRmsByLabel.tab = tabRms;
+      lastRmsByLabel.mic = micRms;
+      lastRmsByLabel.system_audio = sysRms;
 
       barTab.style.width = Math.min(tabRms * 400, 100) + '%';
       barMic.style.width = Math.min(micRms * 400, 100) + '%';
@@ -408,11 +728,16 @@ async function stopCapture() {
     await Promise.allSettled(activeRecorders.map(({ stopped }) => stopped));
     recorders = [];
 
+    Object.keys(transcribeBuffers).forEach((label) => {
+      flushTranscriptionBuffer(label);
+    });
+
     finalizeRecordings();
   } catch (err) {
     console.error(err);
     log(`Stop encountered an issue: ${err?.message || err}`, 'log-error');
   } finally {
+    stopMicTranscription();
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
     if (tabMonitorNodes) {
       try {

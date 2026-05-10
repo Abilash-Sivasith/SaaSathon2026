@@ -10,7 +10,7 @@
   --success: #2d9d4f;
   --warning: #c77a00;
   --radius: 12px;
-  --font: "DM Sans", system-ui, sans-serif;
+  --font: var(--font-dm-sans), system-ui, sans-serif;
 }
 
 *,
@@ -103,7 +103,6 @@ button:focus-visible,
   text-decoration: none;
   opacity: 0.9;
 }
-
 
 .topbar-right {
   display: flex;

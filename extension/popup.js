@@ -34,6 +34,8 @@ const lastRmsByLabel = { tab: 0, mic: 0, system_audio: 0 };
 const INGEST_ENDPOINT = 'http://localhost:8000/ingest';
 const FACE_ENDPOINT = 'http://localhost:8000/face';
 const MEETING_CONTEXT_ENDPOINT = 'http://localhost:8000/meeting-context';
+/** Open when the user clicks Stop (e.g. local Next.js landing). */
+const STOP_REDIRECT_URL = 'http://localhost:3000';
 const TRANSCRIBE_ENABLED = true;
 const FACE_ENABLED = true;
 
@@ -1149,6 +1151,12 @@ async function stopCapture() {
     stopBtn.disabled  = true;
     emitEvent('capture_stop', {});
     log('Capture stopped.', 'log-audio');
+
+    chrome.tabs.create({ url: STOP_REDIRECT_URL }, () => {
+      if (chrome.runtime.lastError) {
+        console.warn('post-stop redirect:', chrome.runtime.lastError.message);
+      }
+    });
   }
 }
 

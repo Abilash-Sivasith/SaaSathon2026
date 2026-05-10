@@ -72,6 +72,13 @@ let micTranscribeTimer = null;
 let micPcmBuffer = [];
 let micPcmSampleRate = 48000;
 
+let tabTranscribeCtx = null;
+let tabTranscribeProcessor = null;
+let tabTranscribeSource = null;
+let tabTranscribeTimer = null;
+let tabPcmBuffer = [];
+let tabPcmSampleRate = 48000;
+
 /** Latest insight keywords from the server (used when rebuilding overlay). */
 let lastOverlayInsight = '';
 const OVERLAY_RIGHT_TEXT_ID = 'obli-overlay-right-text';
@@ -287,6 +294,66 @@ function stopMicTranscription() {
   if (micTranscribeCtx) {
     micTranscribeCtx.close();
     micTranscribeCtx = null;
+  }
+}
+
+function flushTabPcm(label = 'tab', options = {}) {
+  const tail = options.tail === true;
+  if (!tabPcmBuffer.length) return;
+
+  const mergedLen = tabPcmBuffer.reduce((sum, b) => sum + b.length, 0);
+  const merged = new Float32Array(mergedLen);
+  let offset = 0;
+  tabPcmBuffer.forEach((b) => {
+    merged.set(b, offset);
+    offset += b.length;
+  });
+  tabPcmBuffer = [];
+
+  const mergedRms = pcmSamplesRms(merged);
+  if (mergedRms < TRANSCRIBE_MIN_RMS && !tail) return;
+
+  const downsampled = downsampleBuffer(merged, tabPcmSampleRate, 16000);
+  const wavBlob = encodeWav(downsampled, 16000);
+  enqueueTranscriptionChunk(label, wavBlob, 'audio/wav');
+}
+
+function startTabTranscription(stream) {
+  if (tabTranscribeCtx) return;
+  tabPcmBuffer = [];
+
+  tabTranscribeCtx = new AudioContext();
+  tabPcmSampleRate = tabTranscribeCtx.sampleRate;
+  tabTranscribeSource = tabTranscribeCtx.createMediaStreamSource(stream);
+  tabTranscribeProcessor = tabTranscribeCtx.createScriptProcessor(4096, 1, 1);
+  tabTranscribeSource.connect(tabTranscribeProcessor);
+  tabTranscribeProcessor.connect(tabTranscribeCtx.destination);
+  tabTranscribeProcessor.onaudioprocess = (ev) => {
+    const data = ev.inputBuffer.getChannelData(0);
+    tabPcmBuffer.push(new Float32Array(data));
+  };
+  tabTranscribeTimer = setInterval(() => {
+    flushTabPcm('tab');
+  }, AUDIO_PCM_FLUSH_MS);
+}
+
+function stopTabTranscription() {
+  if (tabTranscribeTimer) {
+    clearInterval(tabTranscribeTimer);
+    tabTranscribeTimer = null;
+  }
+  flushTabPcm('tab', { tail: true });
+  if (tabTranscribeProcessor) {
+    tabTranscribeProcessor.disconnect();
+    tabTranscribeProcessor = null;
+  }
+  if (tabTranscribeSource) {
+    tabTranscribeSource.disconnect();
+    tabTranscribeSource = null;
+  }
+  if (tabTranscribeCtx) {
+    tabTranscribeCtx.close();
+    tabTranscribeCtx = null;
   }
 }
 
@@ -585,6 +652,8 @@ function cleanupPartialCapture() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
   stopFaceCapture();
+  stopTabTranscription();
+  stopMicTranscription();
 
   [screenStream, tabStream, micStream, cameraStream].forEach(s => s?.getTracks().forEach(t => t.stop()));
   screenStream = tabStream = micStream = cameraStream = null;
@@ -1021,6 +1090,9 @@ async function startCapture() {
     log('Requesting tab audio…', 'log-audio');
     tabStream = await captureTabAudioStream();
     emitEvent('capture_start', { source: 'tab_audio' });
+    if (TRANSCRIBE_ENABLED) {
+      startTabTranscription(tabStream);
+    }
 
     // 2. Microphone
     currentStep = 'microphone';
@@ -1115,6 +1187,8 @@ async function startCapture() {
 async function stopCapture() {
   if (stopBtn.disabled) return;
   try {
+    stopTabTranscription();
+    stopMicTranscription();
     Object.keys(transcribeBuffers).forEach((label) => {
       flushTranscriptionBuffer(label, undefined, { force: true });
     });
@@ -1125,7 +1199,6 @@ async function stopCapture() {
     log(`Stop encountered an issue: ${err?.message || err}`, 'log-error');
   } finally {
     stopFaceCapture();
-    stopMicTranscription();
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
     if (tabMonitorNodes) {
       try {

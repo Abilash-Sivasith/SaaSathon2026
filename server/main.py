@@ -302,6 +302,8 @@ INSIGHT_FAST_MAX_ITEMS = int(os.getenv("INSIGHT_FAST_MAX_ITEMS", "3"))
 INSIGHT_CONTEXT_FALLBACK = os.getenv("INSIGHT_CONTEXT_FALLBACK", "1").strip().lower() not in ("0", "false", "no")
 INSIGHT_RETURN_LAST_ON_NO_MATCH = os.getenv("INSIGHT_RETURN_LAST_ON_NO_MATCH", "1").strip().lower() not in ("0", "false", "no")
 INSIGHT_CONTEXT_FALLBACK_CHARS = int(os.getenv("INSIGHT_CONTEXT_FALLBACK_CHARS", "6000"))
+INSIGHT_CROSS_SOURCE_CHARS = int(os.getenv("INSIGHT_CROSS_SOURCE_CHARS", "480"))
+INSIGHT_CROSS_SOURCE_BLEND = os.getenv("INSIGHT_CROSS_SOURCE_BLEND", "1").strip().lower() not in ("0", "false", "no")
 
 
 def _is_vague_followup(text: str, tokens: set[str] | frozenset[str]) -> bool:
@@ -1056,6 +1058,36 @@ def append_transcript_for_insight(segment: str) -> str:
     return joined
 
 
+LAST_TRANSCRIPT_SNIPPET_BY_SOURCE: dict[str, str] = {}
+
+
+def _blend_other_sources_for_retrieval(source: str, text: str) -> str:
+    """Include recent text from other audio sources (e.g. tab vs mic) in the retrieval query."""
+    if not INSIGHT_CROSS_SOURCE_BLEND or not text.strip():
+        return text
+    src = (source or "unknown").strip().lower()
+    extras: list[str] = []
+    for key, snippet in LAST_TRANSCRIPT_SNIPPET_BY_SOURCE.items():
+        if key == src:
+            continue
+        s = (snippet or "").strip()
+        if s:
+            extras.append(s[-INSIGHT_CROSS_SOURCE_CHARS:])
+    if not extras:
+        return text
+    return f"{text} {' '.join(extras)}".strip()
+
+
+def _remember_transcript_snippet_for_source(source: str, text: str) -> None:
+    if not INSIGHT_CROSS_SOURCE_BLEND or not text.strip():
+        return
+    src = (source or "unknown").strip().lower()
+    t = text.strip()
+    if len(t) > INSIGHT_CROSS_SOURCE_CHARS:
+        t = t[-INSIGHT_CROSS_SOURCE_CHARS:]
+    LAST_TRANSCRIPT_SNIPPET_BY_SOURCE[src] = t
+
+
 TRANSCRIBE_QUALITY_MODE = os.getenv("OPENAI_TRANSCRIBE_QUALITY", "clarity").strip().lower()
 _default_transcribe_model = "gpt-4o-mini-transcribe" if TRANSCRIBE_QUALITY_MODE == "realtime" else "gpt-4o-transcribe"
 MODEL = os.getenv("OPENAI_MODEL", _default_transcribe_model)
@@ -1718,6 +1750,9 @@ async def _run_transcription(payload: IngestIn, api_key: str) -> dict[str, objec
 
     transcript_log.info("%s", text)
 
+    retrieval_text = _blend_other_sources_for_retrieval(payload.source, text)
+    _remember_transcript_snippet_for_source(payload.source, text)
+
     delivery: dict[str, object] | None = None
     try:
         wav_for_metrics = prepare_transcription_wav(audio, payload.mimeType or "audio/webm")
@@ -1729,15 +1764,15 @@ async def _run_transcription(payload: IngestIn, api_key: str) -> dict[str, objec
     insight_reply = ""
     if not INSIGHT_DISABLED:
         try:
-            ref_text = get_relevant_reference_context(text, ctx)
-            insight = synthesize_fast_insight(ref_text, text, ctx)
+            ref_text = get_relevant_reference_context(retrieval_text, ctx)
+            insight = synthesize_fast_insight(ref_text, retrieval_text, ctx)
             if not insight and ref_text and INSIGHT_LLM_FALLBACK:
                 insight = await asyncio.to_thread(
                     synthesize_insight,
                     api_key,
                     ref_text,
                     ctx,
-                    text,
+                    retrieval_text,
                 )
             elif not insight:
                 insight = "ok"

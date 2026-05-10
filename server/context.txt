@@ -6,7 +6,6 @@ You will be passed infomation regarding product infomation, pricing, and previou
 Given the following inputs (or simliar) output the following:
 
 Case 1: Product infomation:
-(Only show when user specifically asks about new product)
 - product name is Oblique
 - Sales training tool
 - real time infomation retrival

@@ -82,12 +82,14 @@ function Popup() {
 
       <div className="control-grid">
         <button
+          type="button"
           id="start"
           className="control-button control-button-start"
         >
           Start
         </button>
         <button
+          type="button"
           id="stop"
           disabled
           className="control-button control-button-stop"
@@ -98,12 +100,14 @@ function Popup() {
 
       <div className="control-grid">
         <button
+          type="button"
           id="overlay-toggle"
           className="control-button control-button-overlay"
         >
           Show Overlay
         </button>
         <button
+          type="button"
           id="popout"
           className="control-button control-button-panel"
         >

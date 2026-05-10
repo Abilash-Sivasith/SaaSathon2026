@@ -33,6 +33,7 @@ const transcribeTimers = {};
 const lastRmsByLabel = { tab: 0, mic: 0, system_audio: 0 };
 const INGEST_ENDPOINT = 'http://localhost:8000/ingest';
 const FACE_ENDPOINT = 'http://localhost:8000/face';
+const MEETING_CONTEXT_ENDPOINT = 'http://localhost:8000/meeting-context';
 const TRANSCRIBE_ENABLED = true;
 const FACE_ENABLED = true;
 
@@ -56,7 +57,7 @@ const FEEDBACK_STATE_SCORE_MARGIN = 0.65;
 
 /** RHS rolling hint panel: append blocks, expire after TTL, throttle new blocks. */
 const HINT_FEED_TTL_MS = 20000;
-const HINT_FEED_MIN_INTERVAL_MS = 3200;
+const HINT_FEED_MIN_INTERVAL_MS = 2600;
 const HINT_FEED_TICK_MS = 1000;
 /** Throttle delivery-driven LHS meter repaints (semantic / tempo / wording) so captions change less often. */
 const LHS_METER_FROM_DELIVERY_MS = 3200;
@@ -88,6 +89,10 @@ const LHS_LANGUAGE_CAP_ID = 'obli-overlay-lhs-language-cap';
 let overlayInsightTabId = null;
 /** Last finalized transcript shown in red so the user can confirm what was heard. */
 let lastOverlayHeardSentence = 'Listening…';
+/** Dedupe identical hint bullets only when the spoken chunk is unchanged (new speech → allow repeat cues). */
+let lastPushedInsightRaw = '';
+let lastPushedInsightForTranscript = '';
+let pendingQueuedTranscript = '';
 /** Last ingest `delivery` object from the server (semantic / tempo / language bars). */
 let lastDeliverySnapshot = null;
 /** `{ ts, bullets }` oldest → newest; pruned by age for the rolling RHS panel. */
@@ -104,6 +109,10 @@ let lastSpokenText = '';
 let lastFeedbackUpdateTs = 0;
 const feedbackHistory = [];
 let acceptedFaceFeedback = null;
+/** Prevent stacked overlay inject / panel RPC clicks from odd Chrome timing. */
+let overlayToggleInFlight = false;
+let panelCloseInFlight = false;
+let lastPanelCloseAt = 0;
 
 let cameraVideo = null;
 let faceInterval = null;
@@ -363,7 +372,7 @@ async function drainTranscriptionQueue(label) {
       if (spoken) updateOverlayRightPanelHeard(spoken);
       if (spoken) lastSpokenText = spoken;
       const insight = data.insight != null ? String(data.insight).trim() : '';
-      if (insight) updateOverlayRightPanelInsight(insight);
+      if (insight) updateOverlayRightPanelInsight(insight, spoken);
       if (data.delivery) {
         lastDeliverySnapshot = data.delivery;
         scheduleLhsMetersFromDelivery();
@@ -585,6 +594,9 @@ function cleanupPartialCapture() {
 
   lastDeliverySnapshot = null;
   lastOverlayInsight = '';
+  lastPushedInsightRaw = '';
+  lastPushedInsightForTranscript = '';
+  pendingQueuedTranscript = '';
   stopHintFeedTicker();
   if (hintAppendTimer) {
     clearTimeout(hintAppendTimer);
@@ -597,6 +609,7 @@ function cleanupPartialCapture() {
   lastLhsDeliveryPaintTs = 0;
   insightHintBlocks = [];
   pendingQueuedInsight = null;
+  pendingQueuedTranscript = '';
   lastHintAppendTs = 0;
   flushPresenterLhsMeters();
   runOnInsightTargetTab((tab) => {
@@ -689,7 +702,7 @@ function formatFaceFeedback(state, reason, feedbackText, confidence = 0.5) {
     return {
       state: 'warning',
       confidence: normalizedConfidence,
-      text: 'Calm down — watch your language.',
+      text: 'Easy there—keep it professional.',
     };
   }
   if (normalized === 'bored') {
@@ -794,7 +807,9 @@ function applyFaceAnalysisResult(face) {
   }
   const stableFeedback = computeStableFaceFeedback(face);
   const now = Date.now();
-  if (stableFeedback.shouldUpdate && now - lastFeedbackUpdateTs >= FEEDBACK_UPDATE_INTERVAL_MS) {
+  const labelChanged = Boolean(stableFeedback.text && stableFeedback.text !== lastFacialLhs.label);
+  const intervalOk = now - lastFeedbackUpdateTs >= FEEDBACK_UPDATE_INTERVAL_MS;
+  if (stableFeedback.shouldUpdate && (intervalOk || labelChanged)) {
     lastFeedbackUpdateTs = now;
     const st = normalizeFaceState(stableFeedback.state);
     const scoreMap = { engaged: 91, neutral: 72, bored: 43, warning: 24 };
@@ -811,7 +826,7 @@ function applySpeechCoachingResult(coach, options = {}) {
   const feedback = formatFaceFeedback(
     coach.state || 'warning',
     coach.reason || '',
-    coach.feedback || 'Calm down — watch your language.',
+    coach.feedback || 'Easy there—keep it professional.',
     coach.confidence ?? 0.95
   );
   acceptedFaceFeedback = {
@@ -939,6 +954,40 @@ function resetTranscriptionBuffers() {
   });
 }
 
+/** Pull lines from context.txt-style body so the overlay can show facts before the first transcript. */
+function extractMeetingContextBulletLines(text) {
+  const lines = String(text || '').split(/\n+/);
+  const out = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const dash = line.match(/^\s*[-*•]\s+(.+)/);
+    if (dash) {
+      const b = dash[1].trim();
+      if (b.length >= 3) out.push(b);
+    }
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
+async function prefetchMeetingContextForOverlay() {
+  try {
+    const res = await fetch(MEETING_CONTEXT_ENDPOINT);
+    if (!res.ok) return;
+    const data = await res.json();
+    const bullets = extractMeetingContextBulletLines(data.text || '');
+    if (!bullets.length) return;
+    ensureHintFeedTicker();
+    pruneInsightHintBlocks();
+    insightHintBlocks.push({ ts: Date.now(), bullets: bullets.slice(0, 8) });
+    lastHintAppendTs = 0;
+    renderOverlayHintFeed();
+  } catch {
+    // Server not running or blocked — overlay stays empty until first /ingest.
+  }
+}
+
 // ── Start / Stop ──────────────────────────────────────────────────────────────
 
 async function startCapture() {
@@ -1038,6 +1087,15 @@ async function startCapture() {
     }
     meterLoop();
 
+    insightHintBlocks = [];
+    lastHintAppendTs = 0;
+    pendingQueuedInsight = null;
+    if (hintAppendTimer) {
+      clearTimeout(hintAppendTimer);
+      hintAppendTimer = null;
+    }
+    void prefetchMeetingContextForOverlay();
+
     // Frame capture every 2 seconds
     frameInterval = setInterval(captureFrame, 2000);
 
@@ -1053,6 +1111,7 @@ async function startCapture() {
 }
 
 async function stopCapture() {
+  if (stopBtn.disabled) return;
   try {
     Object.keys(transcribeBuffers).forEach((label) => {
       flushTranscriptionBuffer(label, undefined, { force: true });
@@ -1202,28 +1261,38 @@ function bulletsEqual(a, b) {
 function flushQueuedInsightAppend() {
   hintAppendTimer = null;
   const raw = pendingQueuedInsight;
+  const transcriptChunk = pendingQueuedTranscript;
   pendingQueuedInsight = null;
+  pendingQueuedTranscript = '';
   if (!raw || insightTextIsSkipToken(raw)) return;
 
   const bullets = splitInsightIntoBullets(raw);
   if (!bullets.length) return;
 
   const prev = lastHintBlockBullets();
-  if (prev && bulletsEqual(prev, bullets)) return;
+  const sameChunkAndInsight =
+    prev &&
+    bulletsEqual(prev, bullets) &&
+    raw === lastPushedInsightRaw &&
+    transcriptChunk === lastPushedInsightForTranscript;
+  if (sameChunkAndInsight) return;
 
   pruneInsightHintBlocks();
   insightHintBlocks.push({ ts: Date.now(), bullets });
   lastHintAppendTs = Date.now();
   lastOverlayInsight = raw;
+  lastPushedInsightRaw = raw;
+  lastPushedInsightForTranscript = transcriptChunk;
   renderOverlayHintFeed();
 }
 
-function scheduleInsightHintAppend(text) {
+function scheduleInsightHintAppend(text, transcriptChunk = '') {
   const raw = String(text || '').trim();
   if (!raw || insightTextIsSkipToken(raw)) return;
 
   ensureHintFeedTicker();
   pendingQueuedInsight = raw;
+  pendingQueuedTranscript = String(transcriptChunk || '').trim();
 
   const now = Date.now();
   const elapsed = now - lastHintAppendTs;
@@ -1403,8 +1472,8 @@ function injectOverlayTextById(tabId, tabUrl, elementId, content) {
   );
 }
 
-function updateOverlayRightPanelInsight(insightText) {
-  scheduleInsightHintAppend(insightText);
+function updateOverlayRightPanelInsight(insightText, transcriptChunk = '') {
+  scheduleInsightHintAppend(insightText, transcriptChunk);
 }
 
 function updateOverlayRightPanelHeard(sentence) {
@@ -1471,11 +1540,26 @@ function openDetachedWindow() {
 }
 
 function closeSidePanel() {
-  const sendClose = (windowId) => chrome.runtime.sendMessage({ type: 'close_side_panel', windowId }, () => {
-    window.close();
-  });
+  const now = Date.now();
+  if (panelCloseInFlight || now - lastPanelCloseAt < 450) return;
+  panelCloseInFlight = true;
+  lastPanelCloseAt = now;
+  const release = () => {
+    panelCloseInFlight = false;
+  };
+  const sendClose = (windowId) =>
+    chrome.runtime.sendMessage({ type: 'close_side_panel', windowId }, () => {
+      release();
+      window.close();
+    });
   if (chrome.windows?.getCurrent) {
-    chrome.windows.getCurrent((win) => sendClose(win?.id));
+    chrome.windows.getCurrent((win) => {
+      if (chrome.runtime.lastError) {
+        release();
+        return;
+      }
+      sendClose(win?.id);
+    });
     return;
   }
   sendClose();
@@ -1491,6 +1575,10 @@ function markSidePanelOpen() {
   sendOpen();
 }
 
+function releaseOverlayToggleLock() {
+  overlayToggleInFlight = false;
+}
+
 function setOverlayButtonStatus(text, restoreAfterMs = 0) {
   if (!overlayToggleBtn) return;
   const original = overlayToggleBtn.dataset.defaultText || overlayToggleBtn.textContent || 'Show Overlay';
@@ -1504,6 +1592,8 @@ function setOverlayButtonStatus(text, restoreAfterMs = 0) {
 }
 
 function toggleOverlay() {
+  if (overlayToggleInFlight) return;
+  overlayToggleInFlight = true;
   setOverlayButtonStatus('Checking tab…');
   const withTargetTab = (activeTab) => {
     const tabId = activeTab?.id;
@@ -1511,6 +1601,7 @@ function toggleOverlay() {
     if (!Number.isInteger(tabId)) {
       log('No active tab found for overlay preview.', 'log-error');
       setOverlayButtonStatus('No tab found', 1800);
+      releaseOverlayToggleLock();
       return;
     }
     const tabUrl = activeTab?.url || '';
@@ -1525,14 +1616,16 @@ function toggleOverlay() {
         'log-error'
       );
       setOverlayButtonStatus('Use website tab', 2200);
+      releaseOverlayToggleLock();
       return;
     }
     setOverlayButtonStatus('Showing…');
 
-    chrome.scripting.executeScript(
-      {
-        target: { tabId },
-        func: (overlayTextRight, rightTextId, heardTextId, heardInitial, lhs) => {
+    const runOverlayInject = (panelInitiallyOpen) => {
+      chrome.scripting.executeScript(
+        {
+          target: { tabId },
+          func: (overlayTextRight, rightTextId, heardTextId, heardInitial, lhs, rhsHintStackId, panelInitiallyOpen) => {
           const OVERLAY_ID = 'obli-overlay';
           const existing = document.getElementById(OVERLAY_ID);
           if (existing) {
@@ -1946,43 +2039,63 @@ function toggleOverlay() {
             langFill: LHS_LANGUAGE_FILL_ID,
             langCap: LHS_LANGUAGE_CAP_ID,
           },
+          OVERLAY_RHS_HINT_STACK_ID,
+          Boolean(panelInitiallyOpen),
         ],
       },
       (results) => {
-        if (chrome.runtime.lastError) {
-          const msg = chrome.runtime.lastError.message || 'Unknown script injection error.';
-          if (tabUrl.startsWith('file://')) {
+        try {
+          if (chrome.runtime.lastError) {
+            const msg = chrome.runtime.lastError.message || 'Unknown script injection error.';
+            if (tabUrl.startsWith('file://')) {
+              log(
+                `Overlay inject failed: ${msg} Enable "Allow access to file URLs" in chrome://extensions for this extension, or test on a regular website.`,
+                'log-error'
+              );
+              setOverlayButtonStatus('Allow file URLs', 2400);
+              return;
+            }
             log(
-              `Overlay inject failed: ${msg} Enable "Allow access to file URLs" in chrome://extensions for this extension, or test on a regular website.`,
+              `Overlay inject failed: ${msg} Try a regular website (https://...) instead of a restricted page.`,
               'log-error'
             );
-            setOverlayButtonStatus('Allow file URLs', 2400);
+            setOverlayButtonStatus('Access blocked', 2200);
             return;
           }
-          log(
-            `Overlay inject failed: ${msg} Try a regular website (https://...) instead of a restricted page.`,
-            'log-error'
-          );
-          setOverlayButtonStatus('Access blocked', 2200);
-          return;
-        }
-        const state = results?.[0]?.result?.state;
-        if (state === 'added') {
-          overlayInsightTabId = capturedTabId;
-          log('Transparent overlay preview shown on active tab.', 'log-screen');
-          setOverlayButtonStatus('Hide Overlay');
-          flushPresenterLhsMeters();
-          renderOverlayHintFeed();
-        } else if (state === 'removed') {
-          overlayInsightTabId = null;
-          stopHintFeedTicker();
-          log('Transparent overlay preview removed.', 'log-screen');
-          setOverlayButtonStatus('Show Overlay');
-        } else {
-          setOverlayButtonStatus('Try again', 1600);
+          const state = results?.[0]?.result?.state;
+          if (state === 'added') {
+            overlayInsightTabId = capturedTabId;
+            log('Transparent overlay preview shown on active tab.', 'log-screen');
+            setOverlayButtonStatus('Hide Overlay');
+            flushPresenterLhsMeters();
+            renderOverlayHintFeed();
+          } else if (state === 'removed') {
+            overlayInsightTabId = null;
+            stopHintFeedTicker();
+            log('Transparent overlay preview removed.', 'log-screen');
+            setOverlayButtonStatus('Show Overlay');
+          } else {
+            setOverlayButtonStatus('Try again', 1600);
+          }
+        } finally {
+          releaseOverlayToggleLock();
         }
       }
     );
+    };
+
+    const overlayWindowId = activeTab?.windowId;
+    if (!Number.isInteger(overlayWindowId)) {
+      runOverlayInject(false);
+      return;
+    }
+    chrome.runtime.sendMessage({ type: 'get_panel_state', windowId: overlayWindowId }, (panelState) => {
+      if (chrome.runtime.lastError) {
+        runOverlayInject(false);
+        return;
+      }
+      runOverlayInject(panelState?.panelOpen === true);
+    });
   };
 
   // In detached mode, target the original tab that launched this window.
@@ -1994,6 +2107,7 @@ function toggleOverlay() {
           'log-error'
         );
         setOverlayButtonStatus('Reopen panel', 2200);
+        releaseOverlayToggleLock();
         return;
       }
       withTargetTab(tab);

@@ -19,8 +19,13 @@ SERVER_DIR = Path(__file__).resolve().parent
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-# Quality script targets the rich keyed reference file; production default is context.txt.
+# Quality script targets the rich keyed reference file; production answers use context.txt.
 os.environ["INSIGHT_REFERENCE_PATH"] = str(SERVER_DIR / "reference_context.txt")
+# This script scores retrieval against reference_context, not the default answer index.
+os.environ["INSIGHT_ANSWER_INDEX_PATH"] = str(SERVER_DIR / "reference_context.txt")
+# Expectations in CASES match the legacy demo-specific fast path + overlay rewrites.
+os.environ["INSIGHT_FAST_LITERAL_FROM_SOURCE"] = "0"
+os.environ["INSIGHT_FAST_DEMO_FILTERS"] = "1"
 
 import main  # noqa: E402
 
